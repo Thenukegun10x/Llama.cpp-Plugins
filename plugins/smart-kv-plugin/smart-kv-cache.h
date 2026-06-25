@@ -59,6 +59,11 @@ typedef struct {
     uint64_t last_used_step;
     uint32_t access_count;
     float    attention_ema;
+
+    // K/V tensor statistics — cheapest predictive features
+    float k_norm;          // running mean L2 norm(K) / sqrt(head_dim)
+    float v_norm;          // running mean L2 norm(V) / sqrt(head_dim)
+    float k_variance;      // running variance of K norms across tokens in chunk
 } smart_kv_chunk_meta;
 
 typedef struct {

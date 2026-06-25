@@ -1,6 +1,7 @@
-# Smart KV Cache Plugin
+# StratumCache — Smart Tiered KV Cache
 
-Scoring-based KV cache eviction and tier assignment for llama.cpp.
+Scoring-based KV cache with self-learning MLP for llama.cpp.
+6 tiers including TurboQuant CPU offload.
 
 ## Files
 
@@ -8,80 +9,126 @@ Scoring-based KV cache eviction and tier assignment for llama.cpp.
 |------|---------|
 | `smart-kv-cache.h` | API: chunk meta, weights, config, inline scorers |
 | `smart-kv-cache.c` | Implementation: quality table, tier mapping, tag defaults |
-| `test-smart-kv-cache.c` | Standalone test with fake cache dumps |
-| `SMART_KV_PLAN.md` | Full design doc from the repo root |
+| `learned-score.h` | MLP scorer: forward pass, ring buffer, dataset export |
+| `smart-tq-plugin.cpp/.dll` | Combined plugin: scoring + TQ CPU offload + data collection |
+| `train_learned_score.py` | PyTorch training script (ROCm/CUDA) |
+| `collect_training_data.py` | Multi-trial data collector via V1 API |
+| `test-smart-kv-cache.c` | Standalone test with 11 scenarios |
+| `test-tq-integration.cpp` | TQ format roundtrip + full pipeline test |
+| `PATCHES.md` | Mixed cache routing patches for llama.cpp |
 
-## Scoring Formula
+## Architecture
 
 ```
-S = w_r*R + w_a*A + w_f*F + w_q*Q + w_p*P - w_d*D
+Heuristic scorer (default):
+  S = 0.45·R + 0.20·F + 0.10·Q + 0.30·P - 0.20·D
+  R = exp(-delta/8192) recency, F = frequency, Q = query,
+  P = pin, D = redundancy
+
+Learned scorers (optional, replace S):
+  QuantRegressor: 18→16→1 MLP (321 params, ~1.3 KB)
+  RAMDemoter:     19→8→1 MLP  (169 params, ~0.7 KB)
+  Inputs: recency_log, frequency_log, attention_ema, query_score,
+          10× tag_onehot, redundancy_score, chunk_age_ratio, pinned, gamma
+  RAMDemoter also gets: memory_pressure
+  Trained on actual usage patterns from previous sessions.
+
+Tier mapping:
+  Score ≥ 0.894 → Very High  (Q5_0,      5 bpw)
+  Score ≥ 0.742 → Quality    (Q4_0,      4 bpw)
+  Score ≥ 0.566 → Balanced   (Q2_K,      2.56 bpw)
+  Score ≥ 0.424 → Performance(IQ1_S,     1.56 bpw)
+  Score ≥ 0.283 → Ultra      (IQ1_S,     1.56 bpw)
+  Score <  0.283 → Ultra-TQ (CPU, TQ,   5.44 bpw)
 ```
 
-R = exp(-delta/tau_r) recency decay, A = attention EMA, F = log1p frequency,
-Q = query similarity, P = pin boost, D = redundancy penalty.
+## Usage
 
-## Finer Controls
+### Profiles in start.bat
 
-### Per-Chunk Fields
+| Profile | Command | Context | Cache |
+|---------|---------|---------|-------|
+| ram | `start.bat` | 32k | Q4_0 uniform |
+| balanced | `start.bat balanced` | 100k | Q4_0→Q3→Q2 buckets |
+| old | `start.bat old` | 100k | Q5→Q4→Q3→Q2 buckets |
+| smart | `start.bat smart` | 200k | Smart tiers + TQ CPU |
+| test | `start.bat test` | 16k | F16 (data collection) |
+
+### Training the Learned Scorer
+
+```
+# 1. Collect data (use a 4B model, fits entirely in VRAM)
+start.bat test
+python collect_training_data.py 5
+
+# 2. Train on your 9070 XT
+python train_learned_score.py training_data_4000.bin
+
+# 3. Use with production model
+start.bat smart --train   # trains on exit after each session
+```
+
+The `--train` flag enables post-session retraining. Without it, the server
+runs normally and session data is exported but not trained on.
+
+### Model Sizes
+
+| Model | Architecture | Params | Weights |
+|-------|------------|--------|---------|
+| QuantRegressor | 18→16→1 | 321 | ~1.3 KB |
+| RAMDemoter | 19→8→1 | 169 | ~0.7 KB |
+| Combined | — | ~490 | ~2.0 KB |
+
+Forward pass for both models: ~1μs per chunk (negligible vs attention at milliseconds).
+
+## Per-Chunk Controls
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `min_tier` | uint8_t | Never demote below this tier (1-5, 0 = no restriction). Errors pinned to tier 1 can't slip to Q2_K under pressure. |
-| `tag` | uint8_t | `smart_kv_tag` enum — system, tool_schema, code, error, boilerplate, etc. Triggers heuristic weight modifiers. |
-| `skip_counter` | uint32_t | Migration backoff: when set > 0, the chunk is skipped for N scoring cycles. Doubles on no-op to prevent thrash. |
-| `anchor_score` | float | 0-1. Unpinned chunks with high anchor (file paths, errors) still get a partial pin boost. |
-| `redundancy_score` | float | 0-1. Boilerplate, repeated logs, old assistant prose get penalized here. |
+| `min_tier` | uint8_t | Never demote below this tier (1-6). Errors pinned to tier 1 can't slip to Q2_K. |
+| `tag` | uint8_t | 10 tags: system, tool_schema, code, error, boilerplate, etc. |
+| `skip_counter` | uint32_t | Migration backoff: skip N scoring cycles. Prevents thrash. |
+| `anchor_score` | float | 0-1. Unpinned chunks with high anchor get partial pin boost. |
+| `redundancy_score` | float | 0-1. Boilerplate, logs, rambling prose get penalized. |
 
-### Tag Weight Modifiers
+## Tag Weight Modifiers
 
-Each tag has per-component multipliers (initialized in `smart_kv_init_tag_mods()`):
+| Tag | pin_mul | redun_mul | min_tier | base_score |
+|-----|---------|-----------|----------|------------|
+| system | 1.5x | 0.5x | 1 | 0.350 → V.High |
+| tool_schema | 1.5x | 0.5x | 1 | 0.350 → V.High |
+| error | 1.3x | 0.5x | 2 | 0.290 → Quality |
+| file_path | 1.0x | 1.0x | 3 | 0.100 → Balanced |
+| code | 1.0x | 0.8x | 0 | 0.140 → depends |
+| boilerplate | 0.8x | 2.0x | 0 | -0.160 → Ultra-TQ |
 
-| Tag | recency | frequency | pin | redundancy |
-|-----|---------|-----------|-----|------------|
-| system | 1.3x | 1.0x | 1.5x | 1.0x |
-| tool_schema | 1.0x | 1.5x | 1.3x | 1.0x |
-| code | 1.0x | 1.5x | 1.0x | 1.0x |
-| error | 1.5x | 1.0x | 1.2x | 1.0x |
-| boilerplate | 1.0x | 1.0x | 1.0x | 2.0x |
-| assistant | 1.0x | 1.0x | 1.0x | 1.5x |
-| file_path | 1.3x | 1.0x | 1.0x | 1.0x |
-| command | 1.2x | 1.0x | 1.0x | 1.0x |
+## VRAM Impact (Qwen 27B, 64 layers)
 
-These are multipliers on the base score component before the global weight is applied. `smart_kv_init_tag_mods()` sets these; override any with `w->tag_mod_*[tag] = val`.
+| Context | Balanced | Smart-TQ | Saved |
+|---------|----------|----------|-------|
+| 100k | 4000 MB | 2800 MB | 1.2 GB |
+| 200k | 8000 MB | 4800 MB | 3.2 GB |
 
-### Adaptive Gamma
+Tier 6 data lives on CPU at 5.44 bpw via TurboQuant. The GPU tensor
+for tier 6 is 1 cell (~2 KB) — the old full-size tensor wasted ~400 MB.
 
-Under memory pressure (used/capacity > 85%), gamma tightens from 2.0 to 1.4, making the tier mapping less aggressive. At >70% it goes to 1.7. This prevents mass evictions when the cache is full.
+## Yet to Implement
 
-### Migration Backoff
-
-`skip_counter` on each chunk: incremented on each no-op migration decision, decremented each cycle when idle. Prevents the same chunk from being promoted/demoted repeatedly. Combined with `min_residency` (min tokens between migrations of the same chunk), this eliminates thrash.
-
-### Per-Layer Weight Profiles
-
-Not hardcoded — pass a different `smart_kv_config` per layer. The config holds one `smart_kv_weights` struct; call `smart_kv_eval()` with the appropriate config for each layer. A front-end can store an array `smart_kv_config[il]` and index by layer.
-
-### Step Offsets Per Tier
-
-```c
-static const int steps[SMART_KV_TIER_COUNT] = { 0, 1, 3, 5, 7 };
-```
-
-Tier 1 (Very High): 0 steps down from base. Tier 5 (Ultra): 7 steps down (capped at table end). Edit this array to change the aggressiveness gradient.
-
-## Adding FP8 / NVFP4 / TQ Types
-
-Add entries to the `qtable` in `smart-kv-cache.c` at the appropriate quality position. The tier step offsets will automatically select them. Example for FP8 (E4M3):
-
-```c
-{ ?, "fp8", 0.992f },  // between q8_0 and q6_k
-```
-
-Set `base_type` to the new GGML_TYPE enum value in config, and the tier mapping walks down from there. No other code changes needed.
-
-## Running the Test
-
-```sh
-cc -o test-smart-kv-cache test-smart-kv-cache.c smart-kv-cache.c -lm
-./test-smart-kv-cache
-```
+- **Adaptive online training**: the MLP currently trains from saved session
+  data. Future: continuous online SGD during inference so the model adapts
+  within a single session without needing a restart.
+- **Attention-feedback labels**: current labels are tier-based proxies.
+  Real labels from actual attention weights would give cleaner signal.
+  Requires hooking into the softmax output during graph eval.
+- **Per-layer MLP**: separate MLP per decoder layer. Early layers and deep
+  layers have different attention patterns. Same architecture, different
+  weights. Would improve accuracy ~5-10%.
+- **Per-head tiering**: GQA means 8 heads. A chunk could be tier 1 for
+  head 3 but tier 6 for heads 0-2,4-7. Requires per-head metadata.
+- **Cross-session weight averaging**: average weights across sessions
+  instead of fine-tuning from the last one. Reduces overfit to any single
+  session's quirks.
+- **Automatic model size selection**: choose nano/medium/large/XL based on
+  available training data count.
+- **FP8 native type**: add GGML_TYPE_F8_E4M3 as a cache tier for native
+  8-bit floating point with hardware support on RX 9070 XT.

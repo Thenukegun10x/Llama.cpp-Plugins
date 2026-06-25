@@ -12,6 +12,7 @@
 #include "ggml.h"
 #include "../turbo-quant-plugin/turboquant.h"  // PolarQuant+QJL
 #include "smart-kv-cache.h"                     // scoring + tier assignment
+#include "learned-score.h"                      // MLP scorer
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,10 @@ static inline float f16_to_f32(uint16_t h) {
 // ── Per-layer context ────────────────────────────────────────────────
 
 struct SmartTQContext {
+    // Learned scorers (QuantRegressor + RAMDemoter)
+    learned_scorer_t    lscorer;
+    ls_ring_buffer_t    train_ring;
+
     // Model geometry
     int64_t n_embd_k_gqa;
     int64_t n_embd_v_gqa;
@@ -175,6 +180,27 @@ static void* kv_cache_create_layer(const ggml_plugin_kv_cache_params_t* params,
         ctx->chunks[i].min_tier = 0;
     }
 
+    // Initialize learned scorers + ring buffer
+    memset(&ctx->lscorer, 0, sizeof(ctx->lscorer));
+    ls_init_random(&ctx->lscorer, 42);
+    ls_ring_init(&ctx->train_ring);
+
+    // Try to load pre-trained weights (optional)
+    {
+        // First try plugin directory
+        ls_load_all_weights(&ctx->lscorer, ".");
+        if (!ctx->lscorer.quant_loaded) {
+            // Try plugin-relative path
+            ls_load_all_weights(&ctx->lscorer, "plugins/smart-kv-plugin");
+        }
+        if (ctx->lscorer.quant_loaded) {
+            fprintf(stderr, "[smart-tq] QuantRegressor ready\n");
+        }
+        if (ctx->lscorer.ram_loaded) {
+            fprintf(stderr, "[smart-tq] RAMDemoter ready\n");
+        }
+    }
+
     fprintf(stderr, "[smart-tq] layer %d: %ld slots x %d heads, "
             "TQ block=%zuB, scoring table=%zuB\n",
             params->layer_idx, (long)ctx->kv_size, ctx->n_head_kv,
@@ -191,6 +217,15 @@ static void kv_cache_destroy_layer(void* layer_ctx) {
     free(ctx->slot_tier);
     free(ctx->chunks);
     delete ctx;
+}
+
+// ── K/V norm helpers ─────────────────────────────────────────────────
+
+static float compute_k_norm_head(const uint16_t* fp16, int head_dim) {
+    double sum_sq = 0.0;
+    for (int i = 0; i < head_dim; i++)
+        sum_sq += (double)f16_to_f32(fp16[i]) * (double)f16_to_f32(fp16[i]);
+    return (float)(sqrt(sum_sq) / sqrt((double)head_dim));
 }
 
 // ── Encode one head vector to TQ ─────────────────────────────────────
@@ -214,6 +249,10 @@ static void decode_head_fp16(const uint8_t* src, int head_dim,
 }
 
 // ── Score a slot — returns tier ─────────────────────────────────────
+// Uses QuantRegressor for tier 1-5.
+// Tier 6 (RAM eviction) is always decided by heuristic scorer during data
+// collection — RAMDemoter trains on these labels to learn counterfactually.
+// Once trained, RAMDemoter inference can be enabled (see ARCHITECTURE.md).
 
 static uint8_t score_slot(SmartTQContext* ctx, int64_t slot) {
     if (slot < 0 || slot >= ctx->kv_size) return 0;
@@ -228,6 +267,20 @@ static uint8_t score_slot(SmartTQContext* ctx, int64_t slot) {
         if (ctx->slot_tier[i] != 0 || ctx->chunks[i].access_count > 0)
             ctx->cfg.memory_used++;
 
+    // Quant scoring via QuantRegressor or heuristic fallback
+    if (ctx->lscorer.quant_loaded) {
+        ls_features_t feat = ls_features_from_meta(c, ctx->step, (uint32_t)ctx->kv_size, ctx->cfg.weights.gamma);
+        float q_score = qr_forward(&ctx->lscorer.quant, &feat);
+        float gamma = smart_kv_adaptive_gamma(ctx->cfg.weights.gamma, ctx->cfg.memory_used, ctx->cfg.memory_capacity);
+        smart_kv_weights adj = ctx->cfg.weights;
+        if (gamma != adj.gamma) {
+            smart_kv_init_weights(&adj, gamma);
+        }
+        smart_kv_tier t = smart_kv_assign_tier(q_score, c->min_tier, adj.priority_thresholds);
+        return (uint8_t)t;
+    }
+
+    // Heuristic scoring (fallback)
     smart_kv_scored_chunk r = smart_kv_eval(c, ctx->step, max_access, &ctx->cfg);
     return (uint8_t)r.tier;
 }
@@ -255,12 +308,78 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
         smart_kv_chunk_meta* c = &ctx->chunks[slot];
         c->last_used_step = ctx->step;
         c->access_count++;
+
+        // Compute K/V norms — cheap, most predictive features
+        double k_sum_sq = 0.0, v_sum_sq = 0.0;
+        for (int32_t h = 0; h < ctx->n_head_kv; h++) {
+            int off_k = (int)((size_t)t * ctx->n_embd_k_gqa + (size_t)h * ctx->head_dim_k);
+            int off_v = (int)((size_t)t * ctx->n_embd_v_gqa + (size_t)h * ctx->head_dim_v);
+            k_sum_sq += compute_k_norm_head(k_fp16 + off_k, ctx->head_dim_k);
+            v_sum_sq += compute_k_norm_head(v_fp16 + off_v, ctx->head_dim_v);
+        }
+        float k_norm_tok = (float)(k_sum_sq / ctx->n_head_kv);
+        float v_norm_tok = (float)(v_sum_sq / ctx->n_head_kv);
+
+        // Welford online update for running mean + variance
+        if (c->n_tokens == 0) {
+            c->k_norm = k_norm_tok;
+            c->v_norm = v_norm_tok;
+            c->k_variance = 0.0f;
+        } else {
+            float prev_mean = c->k_norm;
+            float delta = k_norm_tok - prev_mean;
+            c->k_norm += delta / (float)(c->n_tokens + 1);
+            c->k_variance += delta * (k_norm_tok - c->k_norm);
+            // V norm: running mean only (variance less useful)
+            c->v_norm += (v_norm_tok - c->v_norm) / (float)(c->n_tokens + 1);
+        }
+        c->n_tokens++;
+
         float attn = 0.5f + 0.5f * ((float)(rand() % 100) / 100.0f);
         float lambda_a = ctx->cfg.weights.lambda_a;
         c->attention_ema = lambda_a * c->attention_ema + (1.0f - lambda_a) * attn;
 
-        // Score to determine tier
+        // Score to determine tier (uses QuantRegressor or heuristic)
         uint8_t tier = score_slot(ctx, slot);
+
+        // Collect training sample (features + labels)
+        // RAM label uses heuristic tier to break circularity:
+        //   heuristic_tier = what the heuristic scorer would assign
+        //   ram_label = 1.0 if heuristic says tier 6 (will be corrected by fixup_labels if re-accessed)
+        {
+            ls_features_t feat = ls_features_from_meta(c, ctx->step, (uint32_t)ctx->kv_size, ctx->cfg.weights.gamma);
+            float mem_pressure = ctx->cfg.memory_capacity > 0
+                ? (float)ctx->cfg.memory_used / (float)ctx->cfg.memory_capacity
+                : 0.0f;
+
+            // Quant label: normalized tier (0.2 = tier 5, 1.0 = tier 1)
+            float quant_label = 1.0f - ((float)(tier - 1) / (float)(SMART_KV_TIER_COUNT - 1));
+            if (tier >= SMART_KV_TIER_ULTRA_TQ) quant_label = 0.0f;
+
+            // Heuristic tier for RAM label (independent of QuantRegressor)
+            float heuristic_tier_f = 0;
+            {
+                uint32_t max_a = 1;
+                for (int64_t i = 0; i < ctx->kv_size; i++)
+                    if (ctx->chunks[i].access_count > max_a) max_a = ctx->chunks[i].access_count;
+                smart_kv_scored_chunk hr = smart_kv_eval(c, ctx->step, max_a, &ctx->cfg);
+                heuristic_tier_f = (float)hr.tier;
+            }
+            uint8_t ht = (uint8_t)heuristic_tier_f;
+            float ram_label = (ht >= SMART_KV_TIER_ULTRA_TQ && !c->pinned) ? 1.0f : 0.0f;
+
+            ls_ring_push(&ctx->train_ring, &feat, quant_label, ram_label, mem_pressure,
+                         c->chunk_id, c->access_count, ht);
+
+            // Auto-export at 1000, 4000 samples
+            if (ctx->train_ring.count == 1000 || ctx->train_ring.count == 4000) {
+                ls_ring_fixup_labels(&ctx->train_ring, ctx->chunks, (uint32_t)ctx->kv_size);
+                char dpath[256];
+                snprintf(dpath, sizeof(dpath), "training_data_%u.bin", ctx->train_ring.count);
+                int n = ls_export_dataset(dpath, &ctx->train_ring);
+                fprintf(stderr, "[smart-tq] exported %d samples to %s\n", n, dpath);
+            }
+        }
 
         if (tier == SMART_KV_TIER_ULTRA_TQ) {
             // ── Tier 6: TQ-encode on CPU only ──
@@ -293,6 +412,9 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
 }
 
 // ── kv_cache_retrieve ───────────────────────────────────────────────
+// Also bumps access_count — a retrieved chunk is still "used" and should
+// not be evicted. Tier-6 chunks that are retrieved are marked for promotion
+// (slot_tier cleared so next scoring cycle assigns a proper GPU tier).
 
 static int kv_cache_retrieve(void* layer_ctx, int64_t pos,
                               void* k_out, void* v_out,
@@ -315,8 +437,20 @@ static int kv_cache_retrieve(void* layer_ctx, int64_t pos,
             continue;
         }
 
+        // Bump access tracking on every retrieve (not just store)
+        smart_kv_chunk_meta* c = &ctx->chunks[slot];
+        ctx->step++;
+        c->last_used_step = ctx->step;
+        c->access_count++;
+
         if (ctx->slot_tier[slot] == SMART_KV_TIER_ULTRA_TQ) {
-            // ── Tier 6: decode from TQ CPU ──
+            // ── Tier 6: decode from TQ CPU, mark for promotion ──
+            // Clear slot_tier so the next scoring cycle promotes this chunk
+            // back to an appropriate GPU tier.
+            ctx->slot_tier[slot] = 0;
+            c->tier = 0;
+            c->target_tier = 0;
+
             uint8_t* k_row = ctx->k_data + slot * row_bytes_k;
             uint8_t* v_row = ctx->v_data + slot * row_bytes_v;
 
@@ -332,13 +466,6 @@ static int kv_cache_retrieve(void* layer_ctx, int64_t pos,
 
         } else {
             // ── Tier 1-5: data is already in the F16 GPU tensor ──
-            // llama.cpp reads from the GPU tensor directly.
-            // This callback provides a buffer for the plugin to fill,
-            // but for F16 tiers, we leave it as-is since the GPU tensor
-            // already has the correct data. We do need to copy it though
-            // because the caller expects this buffer to be filled.
-            // (In the actual plugin integration, this path is optimized
-            //  to skip the CPU round-trip.)
             memcpy(k_fp16 + (size_t)t * ctx->n_embd_k_gqa,
                    ctx->chunks[slot].chunk_id ? k_fp16 : k_fp16,
                    (size_t)ctx->n_embd_k_gqa * sizeof(uint16_t));
@@ -357,6 +484,17 @@ static void kv_cache_clear(void* layer_ctx) {
     SmartTQContext* ctx = (SmartTQContext*)layer_ctx;
     if (!ctx) return;
 
+    // Export training data before clearing (with counterfactual RAM labels)
+    if (ctx->train_ring.count > 100) {
+        ls_ring_fixup_labels(&ctx->train_ring, ctx->chunks, (uint32_t)ctx->kv_size);
+        char dpath[256];
+        time_t now = time(NULL);
+        struct tm * tm_info = localtime(&now);
+        strftime(dpath, sizeof(dpath), "session_%Y%m%d_%H%M%S.bin", tm_info);
+        int n = ls_export_dataset(dpath, &ctx->train_ring);
+        fprintf(stderr, "[smart-tq] session ended, exported %d samples to %s\n", n, dpath);
+    }
+
     size_t total = (size_t)ctx->kv_size * (size_t)ctx->n_head_kv * ctx->tq_bytes;
     memset(ctx->k_data, 0, total);
     memset(ctx->v_data, 0, total);
@@ -373,6 +511,9 @@ static void kv_cache_clear(void* layer_ctx) {
     ctx->step = 0;
     ctx->n_tier6_stored = 0;
     ctx->n_tier6_retrieved = 0;
+
+    // Re-init ring buffer for next session
+    ls_ring_init(&ctx->train_ring);
 
     fprintf(stderr, "[smart-tq] cache cleared\n");
 }
