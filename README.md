@@ -6,9 +6,9 @@ Unofficial plugin system for [llama.cpp](https://github.com/ggerganov/llama.cpp)
 
 | Plugin | Description |
 |--------|-------------|
-| **sage-attention-plugin** | HIP attention plugin, activated with `--plugin-attn on` |
-| **turbo-quant-plugin** | KV-cache compression plugin (not enabled by default) |
-| **smart-kv-plugin** | Smart KV-cache management with TQ integration |
+| **sage-attention-plugin** | HIP Flash Attention acceleration for ROCm (RX 9070 XT). Falls back to built-in Flash Attention for unsupported shapes. Activated with `--plugin-attn on`. |
+| **turbo-quant-plugin** | KV-cache compression plugin using TurboQuant (TQ3/TQ4). Not enabled by default — for experimental use with `--plugin-kv-cache on`. |
+| **smart-kv-plugin** | Scoring-based KV-cache eviction and tier assignment. Evaluates chunks by recency, attention, frequency, query similarity, pin boost, and redundancy penalty to dynamically assign quantization tiers. |
 
 ## How it works
 
