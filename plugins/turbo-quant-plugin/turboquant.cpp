@@ -58,7 +58,22 @@ typedef struct {
 static void build_cos_sin_lut(cos_sin_pair_t* lut, int bits) {
     int n = 1 << bits;
     for (int i = 0; i < n; i++) {
-        float theta = ((float)i + 0.5f) / (float)n * 2.0f * (float)M_PI - (float)M_PI;
+        float theta;
+        if (bits == 3) {
+            static const float TQ3_ANGLES[8] = {
+                -7.0f * (float)M_PI / 8.0f,
+                -3.0f * (float)M_PI / 4.0f,
+                -5.0f * (float)M_PI / 8.0f,
+                -1.0f * (float)M_PI / 4.0f,
+                 1.0f * (float)M_PI / 8.0f,
+                 1.0f * (float)M_PI / 4.0f,
+                 5.0f * (float)M_PI / 8.0f,
+                 3.0f * (float)M_PI / 4.0f,
+            };
+            theta = TQ3_ANGLES[i];
+        } else {
+            theta = ((float)i + 0.5f) / (float)n * 2.0f * (float)M_PI - (float)M_PI;
+        }
         lut[i].cos_val = cosf(theta);
         lut[i].sin_val = sinf(theta);
     }
@@ -100,11 +115,30 @@ int turboquant_valid_dims(int d) {
 // ─── Internal: PolarQuant with configurable offsets ─────────────────────
 // Writes radius (FP16) at dst + radius_off, angles at dst + angles_off.
 
+// For non-uniform codebooks (TQ-3), find nearest entry by dot product
+static uint16_t quant_angle_nearest(float theta, const cos_sin_pair_t* lut, int n) {
+    float ct = cosf(theta);
+    float st = sinf(theta);
+    int best = 0;
+    float best_dot = lut[0].cos_val * ct + lut[0].sin_val * st;
+    for (int i = 1; i < n; i++) {
+        float d = lut[i].cos_val * ct + lut[i].sin_val * st;
+        if (d > best_dot) { best_dot = d; best = i; }
+    }
+    return (uint16_t)best;
+}
+
 static void polar_quant_encode_raw(const float* src, int d, uint8_t* dst,
                                     int bits, int radius_off, int angles_off)
 {
     float* buf = (float*)malloc((size_t)d * sizeof(float));
     memcpy(buf, src, (size_t)d * sizeof(float));
+
+    cos_sin_pair_t* lut = NULL;
+    if (bits == 3) {
+        lut = (cos_sin_pair_t*)malloc(8 * sizeof(cos_sin_pair_t));
+        build_cos_sin_lut(lut, 3);
+    }
 
     uint64_t bit_pos = 0;
     int n = d;
@@ -113,12 +147,19 @@ static void polar_quant_encode_raw(const float* src, int d, uint8_t* dst,
             float x = buf[2 * i];
             float y = buf[2 * i + 1];
             buf[i] = sqrtf(x * x + y * y);
-            write_bits(dst + angles_off, bit_pos, quant_angle(atan2f(y, x), bits), bits);
+            uint16_t q;
+            if (lut) {
+                q = quant_angle_nearest(atan2f(y, x), lut, 8);
+            } else {
+                q = quant_angle(atan2f(y, x), bits);
+            }
+            write_bits(dst + angles_off, bit_pos, q, bits);
             bit_pos += bits;
         }
         n /= 2;
     }
 
+    free(lut);
     uint16_t fr = f32_to_f16(buf[0]);
     memcpy(dst + radius_off, &fr, 2);
     free(buf);

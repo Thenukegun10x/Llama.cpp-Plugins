@@ -231,7 +231,7 @@ typedef struct {
 } ls_sample_t;
 
 // Ring buffer (shared — stores both labels per sample)
-#define LS_RING_CAPACITY 8192
+#define LS_RING_CAPACITY 131072  // ~2000 tokens before wrap; 13 MB
 
 typedef struct {
     ls_sample_t samples[LS_RING_CAPACITY];
@@ -377,35 +377,6 @@ static inline int ls_load_ram_weights(const char * path, ram_demoter_t * m) {
     return (nread == total) ? 0 : -1;
 }
 
-// ── Load all weights (convenience) ────────────────────────────────────
-// Tries: quant_weights.bin + ram_weights.bin in the given directory.
-// Falls back to random init if files don't exist (bootstrapping).
-
-static inline void ls_load_all_weights(learned_scorer_t * ls, const char * dir) {
-    char qpath[512], rpath[512];
-
-    snprintf(qpath, sizeof(qpath), "%s/quant_weights.bin", dir);
-    snprintf(rpath, sizeof(rpath), "%s/ram_weights.bin", dir);
-
-    ls->quant_loaded = (ls_load_quant_weights(qpath, &ls->quant) == 0);
-    ls->ram_loaded   = (ls_load_ram_weights(rpath, &ls->ram) == 0);
-
-    if (ls->quant_loaded) {
-        fprintf(stderr, "[learned] loaded quant_weights.bin\n");
-    } else {
-        qr_init_random(&ls->quant, 42);
-        ls->quant_loaded = true;
-        fprintf(stderr, "[learned] quant_weights.bin not found, using random init\n");
-    }
-    if (ls->ram_loaded) {
-        fprintf(stderr, "[learned] loaded ram_weights.bin\n");
-    } else {
-        rd_init_random(&ls->ram, 42);
-        ls->ram_loaded = true;
-        fprintf(stderr, "[learned] ram_weights.bin not found, using random init\n");
-    }
-}
-
 // ── Random init for bootstrapping ─────────────────────────────────────
 
 static inline void qr_init_random(quant_regressor_t * m, unsigned int seed) {
@@ -437,8 +408,38 @@ static inline void rd_init_random(ram_demoter_t * m, unsigned int seed) {
 static inline void ls_init_random(learned_scorer_t * ls, unsigned int seed) {
     qr_init_random(&ls->quant, seed);
     rd_init_random(&ls->ram, seed);
-    ls->quant_loaded = true;
-    ls->ram_loaded = true;
+    ls->quant_loaded = false;
+    ls->ram_loaded = false;
+}
+
+// ── Load all weights (convenience) ────────────────────────────────────
+// Tries: quant_weights.bin + ram_weights.bin in the given directory.
+// Leaves existing initialized weights untouched if files don't exist.
+// loaded flags mean real files were loaded, not random fallback.
+
+static inline int ls_load_all_weights(learned_scorer_t * ls, const char * dir) {
+    char qpath[512], rpath[512];
+
+    snprintf(qpath, sizeof(qpath), "%s/quant_weights.bin", dir);
+    snprintf(rpath, sizeof(rpath), "%s/ram_weights.bin", dir);
+
+    quant_regressor_t qtmp;
+    ram_demoter_t rtmp;
+    bool quant_ok = (ls_load_quant_weights(qpath, &qtmp) == 0);
+    bool ram_ok   = (ls_load_ram_weights(rpath, &rtmp) == 0);
+
+    if (quant_ok) {
+        ls->quant = qtmp;
+        ls->quant_loaded = true;
+        fprintf(stderr, "[learned] loaded %s\n", qpath);
+    }
+    if (ram_ok) {
+        ls->ram = rtmp;
+        ls->ram_loaded = true;
+        fprintf(stderr, "[learned] loaded %s\n", rpath);
+    }
+
+    return (quant_ok ? 1 : 0) + (ram_ok ? 1 : 0);
 }
 
 #ifdef __cplusplus

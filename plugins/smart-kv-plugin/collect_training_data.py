@@ -1,339 +1,381 @@
 """
-Multi-trial data collector for learned scorer. Runs each scenario N times.
+Collect higher-quality Smart KV training data from a running llama-server.
 
-Produces clean training data by simulating realistic agentic coding sessions
-with proper multi-turn conversation context preserved.
+Recommended server preset:
+  start.bat test
 
-Usage:
-  start.bat test                     # with Qwen 3.5 4B
-  python collect_training_data.py 5  # 5 trials → ~2000+ samples
-  python train_learned_score.py training_data_4000.bin
+That preset enables the smart KV plugin in training mode, disables old learned
+weights during collection, uses heuristic teacher labels, and exports datasets
+into this plugin directory.
 """
 
-import urllib.request
-import urllib.error
-import sys
-import time
+import argparse
+import glob
 import json
 import os
-import glob
+import struct
+import sys
+import time
+import urllib.request
+
 
 BASE_URL = "http://127.0.0.1:12345"
-N_TRIALS = 5 if len(sys.argv) < 2 else int(sys.argv[1])
-MODEL_NAME = None  # auto-detected from /v1/models
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(PLUGIN_DIR, "..", ".."))
+TRAINER = os.path.join(ROOT_DIR, "train_learned_score.py")
 
 
-def _api_post(path, body, timeout=120):
-    """POST to the V1 API, return parsed JSON."""
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(f"{BASE_URL}{path}", data=data,
+def api_post(base_url, path, body, timeout=180):
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}{path}",
+        data=data,
         headers={"Content-Type": "application/json"},
-        method="POST")
+        method="POST",
+    )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
-def _api_get(path, timeout=10):
-    """GET from the V1 API, return parsed JSON."""
-    req = urllib.request.Request(f"{BASE_URL}{path}", method="GET")
+
+def api_get(base_url, path, timeout=10):
+    req = urllib.request.Request(f"{base_url}{path}", method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
-def send_chat(messages, max_tokens=512):
-    """Send a chat completion, returns (reply_text, prompt_tokens)."""
-    global MODEL_NAME
-    data = _api_post("/v1/chat/completions", {
-        "model": MODEL_NAME or "default",
+
+def estimate_tokens(messages):
+    return max(1, sum(len(m.get("content", "")) for m in messages) // 4)
+
+
+def send_chat(base_url, messages, max_tokens, temperature, seed):
+    body = {
+        "model": "default",
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.0,
-    })
-    text = data["choices"][0]["message"]["content"]
+        "temperature": temperature,
+        "seed": seed,
+    }
+    data = api_post(base_url, "/v1/chat/completions", body)
+    text = data["choices"][0]["message"].get("content", "")
     usage = data.get("usage", {})
-    pt = usage.get("prompt_tokens", len(json.dumps(messages)) // 4)
-    return text, pt
+    prompt_tokens = usage.get("prompt_tokens", estimate_tokens(messages))
+    return text, prompt_tokens
 
 
-def run_scenario(scenario):
-    """
-    Run one scenario as a proper multi-turn conversation.
-    Builds history incrementally: each user message is followed by
-    an assistant reply appended to history for the next turn.
-    """
-    original = scenario["gen"]()
-    history = []
-    total_tokens = 0
+def code_blob(round_id):
+    return f"""
+// src/core/cache_manager_{round_id}.cpp
+class CacheManager {{
+public:
+    bool insert(std::string key, std::vector<float> value);
+    std::optional<std::vector<float>> lookup(const std::string& key) const;
+    void compact(size_t target_bytes);
+private:
+    std::unordered_map<std::string, Entry> entries_;
+    std::mutex mu_;
+}};
 
-    for msg in original:
-        history.append(msg)
+bool CacheManager::insert(std::string key, std::vector<float> value) {{
+    if (key.empty()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    entries_[key] = Entry{{std::move(value), Clock::now(), {round_id}}};
+    return true;
+}}
+""".strip()
 
-        if msg["role"] == "system":
-            continue
 
-        # Send entire conversation history (system + prior turns + this msg)
+def log_blob(round_id):
+    lines = []
+    for i in range(34):
+        level = ["INFO", "DEBUG", "WARN", "ERROR", "TRACE"][i % 5]
+        lines.append(
+            f"[2026-06-25 12:{round_id:02d}:{i:02d}] [{level}] "
+            f"worker={i % 7} shard=kv-{(i + round_id) % 4} event=cache_probe "
+            f"latency_ms={17 + i * 3} bytes={4096 + i * 513}"
+        )
+    return "\n".join(lines)
+
+
+def tool_schema_blob(round_id):
+    schema = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"read_cache_trace_{round_id}",
+                    "description": "Read a cache trace and return chunk reuse statistics.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "include_kv_norms": {"type": "boolean"},
+                            "window": {"type": "integer", "minimum": 1},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+    }
+    return json.dumps(schema, indent=2)
+
+
+def make_sessions():
+    return [
+        {
+            "name": "coding_debug",
+            "max_tokens": 220,
+            "system": "You are a senior C++ performance engineer. Preserve file names, symbols, and error messages exactly.",
+            "turns": lambda r: [
+                f"Memorize this implementation detail for later:\n{code_blob(r)}",
+                "Find the lifetime bug in CacheManager::insert and explain the risk briefly.",
+                "Compiler output: error: use of deleted function 'std::mutex::mutex(const std::mutex&)' in src/core/cache_manager.cpp:41. Fix the design.",
+                "Now recall the exact private field names from the first snippet and propose a minimal patch.",
+                "Write a focused regression test path tests/test_cache_manager.cpp that would catch this bug.",
+            ],
+        },
+        {
+            "name": "delayed_recall",
+            "max_tokens": 160,
+            "system": "You are a precise assistant. Track named facts and recall them later without inventing details.",
+            "turns": lambda r: [
+                f"Anchor facts: project=Orchid-{r}; owner=Marin; hot file=src/kv/reuse_map_{r}.rs; threshold={0.71 + r * 0.01:.2f}; failing test=test_reuse_after_wrap.",
+                "Explain how a cache reuse map should behave under wraparound pressure.",
+                "Summarize the difference between hot prefix tokens and cold generated prose.",
+                "Without scrolling back, what was the project name, hot file, threshold, and failing test?",
+                "Use those exact anchor facts in a short incident report.",
+            ],
+        },
+        {
+            "name": "logs_noise",
+            "max_tokens": 120,
+            "system": "You are an SRE. Separate important error facts from repetitive logs.",
+            "turns": lambda r: [
+                f"Analyze this noisy log block and identify only the important lines:\n{log_blob(r)}",
+                "Which two signals should stay in high-quality cache and which repeated lines are safe to demote?",
+                "A later alert says shard kv-2 regressed again. What earlier evidence matters?",
+                "Write a concise remediation checklist using exact shard names when known.",
+            ],
+        },
+        {
+            "name": "tool_schema",
+            "max_tokens": 180,
+            "system": "You are an agent runtime designer. Tool schemas and argument names are important.",
+            "turns": lambda r: [
+                f"Register this tool schema and remember the required fields:\n{tool_schema_blob(r)}",
+                "Generate a valid tool call JSON for reading traces/session.bin with KV norms enabled.",
+                "Now modify the call to use a window of 128 and preserve the function name exactly.",
+                "What field was required by the schema, and what optional boolean controlled KV norms?",
+            ],
+        },
+        {
+            "name": "mixed_commands",
+            "max_tokens": 170,
+            "system": "You are a build engineer. Commands, flags, and paths are high-value context.",
+            "turns": lambda r: [
+                f"Run sequence: git status --short; python -m pytest tests/test_kv_{r}.py -q; cmake --build build --target smart-tq-plugin",
+                "pytest output: FAILED tests/test_kv_wrap.py::test_retrieve_after_demote - AssertionError: decoded K differs at slot 8192",
+                "Suggest the smallest code area to inspect based on that failure.",
+                "Repeat the exact failing pytest node and the suspicious slot number.",
+            ],
+        },
+        {
+            "name": "long_reasoning",
+            "max_tokens": 240,
+            "system": "You are a systems researcher. Keep the important constraints from earlier turns available.",
+            "turns": lambda r: [
+                f"Design constraints: context={32768 + r * 1024}, gpu_budget=14GB, ram_budget=64GB, target=HumanEval quality within 1 percent of F16.",
+                "Compare FIFO, LRU, attention-based, and learned KV demotion for this target.",
+                "Introduce a counterexample where naive recency hurts code-generation quality.",
+                "Now use the original numeric constraints to choose a safe demotion policy.",
+            ],
+        },
+    ]
+
+
+def exported_files(output_dir):
+    patterns = [
+        os.path.join(output_dir, "training_data_*.bin"),
+        os.path.join(output_dir, "session_*.bin"),
+    ]
+    files = []
+    for pattern in patterns:
+        files.extend(glob.glob(pattern))
+    return sorted(set(files), key=os.path.getmtime)
+
+
+def remove_old_exports(output_dir):
+    for path in exported_files(output_dir):
         try:
-            reply, ptokens = send_chat(history, max_tokens=scenario.get("max_tokens", 256))
-            total_tokens += ptokens
-            # Append assistant reply so next turn sees it
-            history.append({"role": "assistant", "content": reply})
-        except Exception as e:
-            print(f"      error: {e}")
-            break
-
-        time.sleep(0.2)
-
-    return total_tokens
+            os.remove(path)
+            print(f"  removed old export: {os.path.basename(path)}")
+        except OSError as e:
+            print(f"  warning: could not remove {path}: {e}")
 
 
-# ── Scenarios ─────────────────────────────────────────────────────────
-# Each scenario simulates a realistic agentic coding session with 10-20
-# user/assistant exchanges to build up a meaningful KV cache.
-
-def _sys_simple(msg="You are a helpful AI coding assistant."):
-    return lambda: [{"role": "system", "content": msg}]
-
-SCENARIOS = [
-
-    # ── 1. Coding session with tools ────────────────────────────────
-    {
-        "name": "coding_session",
-        "max_tokens": 256,
-        "gen": lambda: _sys_simple("You are an AI coding assistant with access to read_file, search_symbols, and run_tests.")() + [
-            {"role": "user", "content": "Read the file src/core/engine.cpp and explain what it does."},
-            {"role": "user", "content": "Search for all references to the 'Engine' class."},
-            {"role": "user", "content": "Show me the Engine::run function."},
-            {"role": "user", "content": "There's a bug in Engine::run — it doesn't handle exceptions."},
-            {"role": "user", "content": "Write a fix for the exception handling."},
-            {"role": "user", "content": "Run the unit tests for Engine."},
-            {"role": "user", "content": "Test results: 3 failed, 12 passed. Fix the failures."},
-            {"role": "user", "content": "Now add a new method Engine::stop to gracefully shut down."},
-            {"role": "user", "content": "Add documentation for the new method."},
-            {"role": "user", "content": "Run all tests again to verify."},
-        ],
-    },
-
-    # ── 2. Compiler error marathon ──────────────────────────────────
-    {
-        "name": "compiler_errors",
-        "max_tokens": 192,
-        "gen": lambda: _sys_simple("You are a Rust expert.")() + [
-            {"role": "user", "content": "Implement a generic binary search function for any Ord type."},
-            {"role": "user", "content": "error[E0308]: mismatched types: expected u32, found usize"},
-            {"role": "user", "content": "error[E0502]: cannot borrow as mutable because already borrowed"},
-            {"role": "user", "content": "error[E0382]: use of moved value"},
-            {"role": "user", "content": "Fix all three compiler errors."},
-            {"role": "user", "content": "warning: unused variable 'idx' — fix this too."},
-            {"role": "user", "content": "Now write a test module for the binary search."},
-            {"role": "user", "content": "cargo test --test binary_search — fails. Fix."},
-        ],
-    },
-
-    # ── 3. Agentic loop: write → test → fix → verify ──────────────
-    {
-        "name": "agentic_loop",
-        "max_tokens": 256,
-        "gen": lambda: _sys_simple("You are an autonomous coding agent.")() + [
-            {"role": "user", "content": "Write a Python async task queue with worker pool."},
-            {"role": "user", "content": "$ python -m pytest tests/test_queue.py"},
-            {"role": "user", "content": "FAIL: test_queue_submit — RuntimeError: queue already stopped"},
-            {"role": "user", "content": "Fix the RuntimeError in the submit method."},
-            {"role": "user", "content": "$ python -m pytest tests/test_queue.py -v"},
-            {"role": "user", "content": "FAIL: test_queue_parallel_submit — deadlock detected"},
-            {"role": "user", "content": "Fix the deadlock in the worker pool."},
-            {"role": "user", "content": "$ python -m pytest tests/test_queue.py -v"},
-            {"role": "user", "content": "All passed. Now add a cancel method."},
-            {"role": "user", "content": "Write docs for the cancel method."},
-        ],
-    },
-
-    # ── 4. File navigation + review ─────────────────────────────────
-    {
-        "name": "file_review",
-        "max_tokens": 256,
-        "gen": lambda: _sys_simple("You are a senior code reviewer.")() + [
-            {"role": "user", "content": "Review src/core/engine.cpp for memory leaks."},
-            {"role": "user", "content": "Check include/engine/api.h for API compatibility issues."},
-            {"role": "user", "content": "Review tests/test_engine.cpp — are the tests thorough enough?"},
-            {"role": "user", "content": "Check src/utils/logger.cpp for thread safety."},
-            {"role": "user", "content": "Review the Cargo.toml for dependency issues."},
-            {"role": "user", "content": "Run clippy on the entire project."},
-            {"role": "user", "content": "Clippy warnings: 3 style issues, 1 correctness issue."},
-            {"role": "user", "content": "Fix all clippy warnings."},
-            {"role": "user", "content": "Re-run clippy to verify."},
-        ],
-    },
-
-    # ── 5. Boilerplate + logs (cold data) ──────────────────────────
-    {
-        "name": "log_analysis",
-        "max_tokens": 128,
-        "gen": lambda: _sys_simple("You are a system administrator.")() + [
-            {"role": "user", "content":
-                "[2024-01-15 10:23:45] [INFO] Server starting on port 8080\n"
-                "[2024-01-15 10:23:46] [DEBUG] Loading config from /etc/server.yaml\n"
-                "[2024-01-15 10:23:47] [WARN] Deprecated field 'max_users' in config\n"
-                "[2024-01-15 10:23:48] [INFO] Connected to database postgres://localhost:5432\n"
-                "[2024-01-15 10:23:50] [ERROR] Connection pool exhausted: 100/100 connections\n"
-                "[2024-01-15 10:23:51] [CRITICAL] Service unavailable — retry in 30s\n"
-                "[2024-01-15 10:24:00] [INFO] Server shutting down\n"
-                "What caused the crash?"},
-            {"role": "user", "content": "How can we prevent this in the future?"},
-            {"role": "user", "content": "Dump the last 100 log entries from /var/log/app.log"},
-            {"role": "user", "content": "Filter for all ERROR and CRITICAL entries."},
-        ],
-    },
-
-    # ── 6. Long multi-topic conversation (recency decay test) ──────
-    {
-        "name": "long_chat",
-        "max_tokens": 128,
-        "gen": lambda: [
-            {"role": "system", "content": "You are knowledgeable about many topics."},
-        ] + [{"role": "user", "content": p} for p in [
-            "Explain how transformers work.",
-            "What is the difference between L1 and L2 regularization?",
-            "Write a haiku about machine learning.",
-            "Explain the CAP theorem.",
-            "What are the advantages of Rust over C++?",
-            "Describe the OSI model layers.",
-            "What is the difference between TCP and UDP?",
-            "Explain how garbage collection works.",
-            "What is the halting problem?",
-            "Describe the difference between SVM and neural networks.",
-            "Explain what a blockchain actually is.",
-            "What is the P vs NP problem?",
-            "Describe how a database index works.",
-            "What is the difference between HTTP/2 and HTTP/3?",
-        ]],
-    },
-
-    # ── 7. Commands + build output ──────────────────────────────────
-    {
-        "name": "build_cycle",
-        "max_tokens": 256,
-        "gen": lambda: _sys_simple("You are a build engineer.")() + [
-            {"role": "user", "content": "./configure --prefix=/usr/local --enable-optimizations"},
-            {"role": "user", "content": "make -j$(nproc) 2>&1 | tail -50"},
-            {"role": "user", "content": "error: 'Tensor' was not declared in this scope"},
-            {"role": "user", "content": "Fix the Tensor declaration in src/tensor.hpp"},
-            {"role": "user", "content": "make -j$(nproc) 2>&1 | tail -50"},
-            {"role": "user", "content": "collect2: error: ld returned 1 exit status — undefined reference to 'tensor_gemm'"},
-            {"role": "user", "content": "Fix the linker error in CMakeLists.txt"},
-            {"role": "user", "content": "cmake --build build --target all"},
-            {"role": "user", "content": "Build succeeded! Now run the benchmark suite."},
-            {"role": "user", "content": "Benchmark results: 2.3x speedup over baseline."},
-        ],
-    },
-
-    # ── 8. Long system prompt + deep reasoning ─────────────────────
-    {
-        "name": "deep_reasoning",
-        "max_tokens": 384,
-        "gen": lambda: _sys_simple(
-            "You are a research scientist. You think step by step. "
-            "You consider multiple perspectives before answering. "
-            "You cite sources when possible. You acknowledge uncertainty. "
-            "You structure responses with reasoning chains."
-        )() + [
-            {"role": "user", "content": "Design a distributed key-value store with strong consistency."},
-            {"role": "user", "content": "How would you handle network partitions?"},
-            {"role": "user", "content": "Compare Raft vs Paxos for this design."},
-            {"role": "user", "content": "What's the throughput bottleneck in your design?"},
-            {"role": "user", "content": "How would you scale to 1000 nodes?"},
-            {"role": "user", "content": "Analyze the failure modes of your system."},
-        ],
-    },
-]
-
-
-def main():
-    print("=" * 65)
-    print(f" SMART KV - Multi-Trial Data Collector ({N_TRIALS} trials)")
-    print("=" * 65)
-
-    # Check server
+def verify_binary(path):
     try:
-        data = _api_get("/health", timeout=5)
-        print(f" Server: {BASE_URL} (OK)")
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            header = f.read(8)
+            if len(header) != 8:
+                return False, "too small"
+            n_samples_f, n_features_f = struct.unpack("ff", header)
+            n_samples = int(n_samples_f)
+            n_features = int(n_features_f)
+            if n_features != 21:
+                return False, f"expected 21 features, got {n_features}"
+            expected = 8 + n_samples * n_features * 4 + n_samples * 4 * 3
+            if size != expected:
+                return False, f"size mismatch {size} != {expected}"
+            raw_x = f.read(n_samples * n_features * 4)
+            raw_q = f.read(n_samples * 4)
+            raw_r = f.read(n_samples * 4)
+            raw_m = f.read(n_samples * 4)
+        q = struct.unpack(f"{n_samples}f", raw_q) if n_samples else []
+        r = struct.unpack(f"{n_samples}f", raw_r) if n_samples else []
+        m = struct.unpack(f"{n_samples}f", raw_m) if n_samples else []
+        ram_pos = sum(1 for x in r if x > 0.5)
+        q_min = min(q) if q else 0.0
+        q_max = max(q) if q else 0.0
+        mem_mean = sum(m) / len(m) if m else 0.0
+        warnings = []
+        if n_samples < 1000:
+            warnings.append("low sample count")
+        if ram_pos == 0:
+            warnings.append("no positive RAM labels")
+        elif ram_pos < max(5, n_samples // 200):
+            warnings.append("very few RAM positives")
+        if q_max - q_min < 0.05:
+            warnings.append("quant labels have low spread")
+        summary = (
+            f"{n_samples} samples, q=[{q_min:.3f},{q_max:.3f}], "
+            f"ram_pos={ram_pos}/{n_samples}, mem_mean={mem_mean:.3f}"
+        )
+        if warnings:
+            summary += " WARNING: " + ", ".join(warnings)
+        return True, summary
     except Exception as e:
-        print(f" ERROR: Server not reachable: {e}")
-        print(" Start with:  start.bat test")
-        sys.exit(1)
+        return False, str(e)
 
-    # Clear old exported files
-    for f in glob.glob("training_data_*.bin"):
-        os.remove(f)
-        print(f" Removed old: {f}")
 
-    # Get model info (for display only — use "default" as model name)
+def run_collection(args):
+    print("SMART KV training data collector")
+    print(f"  server:     {args.url}")
+    print(f"  output dir: {args.output_dir}")
+    print(f"  rounds:     {args.rounds}")
+    print(f"  temp:       {args.temperature}")
+    print()
+
     try:
-        data = _api_get("/v1/models", timeout=5)
-        global MODEL_NAME
-        model_display = data.get("data", [{}])[0].get("id", "unknown")
-        MODEL_NAME = "default"
-        print(f" Model: {model_display}")
-    except:
-        print(" Model: (unknown)")
-        MODEL_NAME = "default"
+        api_get(args.url, "/health", timeout=5)
+    except Exception as e:
+        raise RuntimeError(f"server is not reachable at {args.url}: {e}")
 
-    print(f" Scenarios: {len(SCENARIOS)}")
-    print(f" Trials:    {N_TRIALS}")
-    print()
+    try:
+        models = api_get(args.url, "/v1/models", timeout=5)
+        model_name = models.get("data", [{}])[0].get("id", "unknown")
+        print(f"  model:      {model_name}")
+    except Exception:
+        print("  model:      unknown")
 
-    total_est_tokens = 0
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.clean:
+        remove_old_exports(args.output_dir)
 
-    for trial in range(N_TRIALS):
-        print(f"{'-' * 65}")
-        print(f" Trial {trial + 1} / {N_TRIALS}")
-        print(f"{'-' * 65}")
+    sessions = make_sessions()
+    histories = {
+        s["name"]: [{"role": "system", "content": s["system"]}]
+        for s in sessions
+    }
 
-        # Warm-up: cold-start query to initialize GPU/cache state
-        if trial == 0:
-            print("  Warm-up...", end=" ", flush=True)
-            _, pt = send_chat([
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Say 'ready'."},
-            ], max_tokens=8)
-            print(f"{pt} tokens")
-            time.sleep(1)
+    total_prompt_tokens = 0
+    total_requests = 0
+    started = time.time()
 
-        trial_tokens = 0
+    for round_id in range(1, args.rounds + 1):
+        print(f"\nRound {round_id}/{args.rounds}")
+        for session in sessions:
+            name = session["name"]
+            turns = session["turns"](round_id)
+            history = histories[name]
+            for turn_idx, user_text in enumerate(turns, 1):
+                history.append({"role": "user", "content": user_text})
+                est = estimate_tokens(history)
+                print(f"  {name:<15} turn {turn_idx}/{len(turns)} prompt~{est:>5} ... ", end="", flush=True)
+                try:
+                    reply, prompt_tokens = send_chat(
+                        args.url,
+                        history,
+                        session["max_tokens"],
+                        args.temperature,
+                        args.seed + round_id + turn_idx,
+                    )
+                except Exception as e:
+                    print(f"ERROR {e}")
+                    history.pop()
+                    continue
+                history.append({"role": "assistant", "content": reply})
+                total_prompt_tokens += prompt_tokens
+                total_requests += 1
+                print(f"ok ({prompt_tokens} prompt tokens)")
+                time.sleep(args.pause)
 
-        for si, scenario in enumerate(SCENARIOS):
-            name = scenario["name"]
-            print(f"  [{si+1:2d}/{len(SCENARIOS)}] {name:20s}...", end=" ", flush=True)
-            tokens = run_scenario(scenario)
-            trial_tokens += tokens
-            print(f"{tokens:5d} tokens")
+        files = exported_files(args.output_dir)
+        if files:
+            newest = files[-1]
+            ok, summary = verify_binary(newest)
+            status = "verified" if ok else "invalid"
+            print(f"  newest export: {os.path.basename(newest)} ({status}: {summary})")
+        else:
+            print("  newest export: none yet")
 
-        total_est_tokens += trial_tokens
-        avg_per_turn = trial_tokens // sum(len(s["gen"]()) for s in SCENARIOS)
-        print(f"  => Trial total: {trial_tokens:,} tokens (~{avg_per_turn} per turn)")
+    elapsed = time.time() - started
+    print("\nCollection complete")
+    print(f"  requests:            {total_requests}")
+    print(f"  summed prompt tokens: {total_prompt_tokens:,}")
+    print(f"  elapsed:             {elapsed:.1f}s")
 
-    # Show results
-    print(f"\n{'=' * 65}")
-    print(" COLLECTION COMPLETE")
-    print(f"{'=' * 65}")
-    print(f" Total tokens processed: {total_est_tokens:,}")
+    files = exported_files(args.output_dir)
+    if not files:
+        print("\nNo export files found yet. Keep the server running until an auto-export threshold is reached, or stop the server to trigger session export.")
+        return
 
-    data_files = sorted(glob.glob("training_data_*.bin"))
-    if data_files:
-        print()
-        for f in data_files:
-            size = os.path.getsize(f)
-            n = max(0, (size - 8) // 68)
-            print(f"  {f}: {size:>8,} bytes  (~{n:,} samples)")
-        best = max(data_files, key=lambda f: os.path.getsize(f))
-        print(f"\n Best dataset: {best}")
-        n_best = max(0, (os.path.getsize(best) - 8) // 68)
-        print(f" Samples:      ~{n_best:,}")
-        print(f"\n Train:")
-        print(f"  python train_learned_score.py {best}")
-    else:
-        print("\n No exported files found. The plugin auto-exports at 1000 and 4000 samples.")
-        print(" You may need more trials or longer scenarios." if N_TRIALS < 10 else " Check that the plugin loaded correctly.")
+    print("\nExported datasets")
+    best = None
+    best_size = -1
+    for path in files:
+        ok, summary = verify_binary(path)
+        size = os.path.getsize(path)
+        print(f"  {os.path.basename(path):<28} {size:>9} bytes  {summary}")
+        if ok and size > best_size:
+            best = path
+            best_size = size
 
-    print()
+    if best:
+        print("\nTrain with:")
+        print(f"  python \"{TRAINER}\" \"{best}\" \"{args.output_dir}\"")
+        print("\nThen restart normal inference with:")
+        print("  start.bat smart")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Collect Smart KV learned-scorer training data.")
+    parser.add_argument("rounds", nargs="?", type=int, default=4, help="collection rounds; default 4")
+    parser.add_argument("--url", default=BASE_URL)
+    parser.add_argument("--output-dir", default=PLUGIN_DIR)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--pause", type=float, default=0.05)
+    parser.add_argument("--clean", action="store_true", help="remove old training_data/session exports first")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        run_collection(parse_args())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)

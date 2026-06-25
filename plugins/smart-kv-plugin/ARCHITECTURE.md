@@ -273,6 +273,15 @@ Compare perplexity and VRAM across cache policies:
    are 3× more expensive than false negatives (keeping unused data on GPU).
    The RAMDemoter should be calibrated with high precision at the cost of recall.
 
+3. **RAM label lookahead is proportional**: `lookahead = min(2048, context_len / 4)`.
+   Short prompts need more lookahead relative to context; long contexts need less
+   because a chunk that wasn't re-accessed in 2048 steps of a 200k context is truly stale.
+
+4. **Gamma in QuantRegressor only**: The adaptive gamma feature goes into
+   QuantRegressor (where it influences tier thresholds) but is excluded from
+   RAMDemoter — RAMDemoter already has `memory_pressure` as a direct feature,
+   making gamma redundant for eviction decisions.
+
 2. **Quant regression is continuous**: Tier boundaries are soft. Under memory
    pressure (high gamma), scores compress and chunks naturally fall into lower tiers.
    No hard boundaries except min_tier (for pinned content).

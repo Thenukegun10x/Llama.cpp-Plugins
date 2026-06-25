@@ -10,6 +10,7 @@ extern "C" {
 
 #define SMART_KV_TIER_COUNT    6
 #define SMART_KV_MAX_TAGS      16
+#define SMART_KV_MAX_TIER_TYPES 8  // TQ bit widths possible: 2,3,4,5,6, raw F16, Q4_0, Q8_0
 
 typedef enum {
     SMART_KV_TIER_VERY_HIGH    = 1,
@@ -98,6 +99,36 @@ typedef struct {
     float         priority;
 } smart_kv_scored_chunk;
 
+// ── Unified memory TQ profiles ───────────────────────────────────────
+// Each profile defines per-tier TQ bit width + weight set for systems
+// where KV cache stays in unified memory (no GPU/CPU split).
+// TQ bits: 0 = F16 (no compression), 2-6 = TQ encode at that bit width.
+
+typedef struct {
+    smart_kv_weights weights;
+    int tq_bits[SMART_KV_TIER_COUNT];  // TQ bits per tier (0=F16)
+    const char * name;
+} smart_kv_tq_profile;
+
+// High quality: near-lossless, ~2× compression
+//   Tier 1-2: F16, Tier 3-4: TQ-5 (0.994), Tier 5: TQ-4 (0.969), Tier 6: TQ-2 (0.941)
+extern const smart_kv_tq_profile SMART_KV_TQ_UNITY_HIGH;
+
+// Balanced: good savings, ~3× compression
+//   Tier 1: F16, Tier 2-3: TQ-5, Tier 4: TQ-4, Tier 5-6: TQ-2
+extern const smart_kv_tq_profile SMART_KV_TQ_UNITY_BALANCED;
+
+// Performance: aggressive compression, ~4×
+//   Tier 1-2: TQ-5, Tier 3-4: TQ-4, Tier 5-6: TQ-2
+extern const smart_kv_tq_profile SMART_KV_TQ_UNITY_PERF;
+
+// Ultra: max compression, ~5×
+//   All tiers: TQ-2
+extern const smart_kv_tq_profile SMART_KV_TQ_UNITY_ULTRA;
+
+// Apply a TQ profile (copies weights + tq_bits into the config)
+void smart_kv_apply_tq_profile(smart_kv_config * cfg, const smart_kv_tq_profile * profile);
+
 // Default weight sets
 extern const smart_kv_weights SMART_KV_WEIGHTS_NO_ATTN;
 extern const smart_kv_weights SMART_KV_WEIGHTS_ATTN;
@@ -112,9 +143,22 @@ void smart_kv_init_tag_mods(smart_kv_weights * w);
 static inline float smart_kv_adaptive_gamma(float base_gamma, uint32_t used, uint32_t capacity) {
     if (capacity == 0) return base_gamma;
     float pressure = (float)used / (float)capacity;
-    if (pressure > 0.85f) return base_gamma * 0.7f;       // tighten tiers under pressure
+    if (pressure > 0.85f) return base_gamma * 0.7f;
     if (pressure > 0.70f) return base_gamma * 0.85f;
     return base_gamma;
+}
+
+// Returns true if memory pressure exceeds the offload threshold
+static inline bool smart_kv_should_offload(uint32_t used, uint32_t capacity, float score) {
+    if (capacity == 0) return false;
+    float pressure = (float)used / (float)capacity;
+    float threshold = 0.05f;
+    if (pressure > 0.92f) threshold = 0.20f;
+    else if (pressure > 0.85f) threshold = 0.12f;
+    else if (pressure > 0.75f) threshold = 0.10f;
+    else if (pressure > 0.65f) threshold = 0.08f;
+    else if (pressure > 0.50f) threshold = 0.05f;
+    return score <= threshold;
 }
 
 // --- Inline hot-path helpers ---

@@ -21,6 +21,13 @@
  * TQ4/TQ3 (TurboQuant): ~0.92/0.90 quality.
  *   { 0, "tq4", 0.920f } after q3_k
  *   { 0, "tq3", 0.900f } after q2_k
+ *
+ * SAFETY: If QTABLE_LEN changes, review smart_kv_tier_to_type — the
+ * fallback path uses QTABLE_LEN/2 as the midpoint. The steps[] array
+ * assumes tier 1 = no step, tier 6 = large step. If adding new types
+ * that are significantly better or worse than existing extremes, ensure
+ * the steps[] offsets don't cause out-of-bounds access (underflow guard
+ * added at ti < 0, overflow at ti >= QTABLE_LEN).
  */
 static const struct { int type; const char * name; float quality; } qtable[] = {
     { 0,  "f16",   1.000f },
@@ -73,6 +80,89 @@ const smart_kv_weights SMART_KV_WEIGHTS_ATTN = {
     .lambda_a     = 0.95f,
     .gamma        = 2.0f,
 };
+
+// ── Unified memory TQ profiles ───────────────────────────────────────
+//
+// TQ bits per tier — quality reference from benchmark:
+//   TQ-6: 0.9985  2.2× compression (near-lossless)
+//   TQ-5: 0.9936  2.6× (Q4-class quality, smaller than Q4)
+//   TQ-4: 0.9694  3.1× (balanced)
+//   TQ-3: 0.9588  3.8× (anomalous, use TQ-2 instead)
+//   TQ-2: 0.9405  5.0× (good direction preservation)
+//
+// Each profile sets weight thresholds and TQ bit widths per tier.
+// Use with: cfg.base_type = -1 (TQ), cfg.tq_bits = profile->tq_bits
+
+const smart_kv_tq_profile SMART_KV_TQ_UNITY_HIGH = {
+    .name = "unity-high",
+    .weights = {
+        .w_recency    = 0.40f,
+        .w_attention  = 0.20f,
+        .w_frequency  = 0.15f,
+        .w_query      = 0.10f,
+        .w_pin        = 0.30f,
+        .w_redundancy = 0.20f,
+        .tau_r        = 16384.0f,
+        .lambda_a     = 0.95f,
+        .gamma        = 2.0f,
+    },
+    .tq_bits = { 0, 0, 5, 5, 4, 2 },
+};
+
+const smart_kv_tq_profile SMART_KV_TQ_UNITY_BALANCED = {
+    .name = "unity-balanced",
+    .weights = {
+        .w_recency    = 0.35f,
+        .w_attention  = 0.15f,
+        .w_frequency  = 0.15f,
+        .w_query      = 0.10f,
+        .w_pin        = 0.25f,
+        .w_redundancy = 0.25f,
+        .tau_r        = 8192.0f,
+        .lambda_a     = 0.95f,
+        .gamma        = 2.0f,
+    },
+    .tq_bits = { 0, 5, 5, 4, 2, 2 },
+};
+
+const smart_kv_tq_profile SMART_KV_TQ_UNITY_PERF = {
+    .name = "unity-perf",
+    .weights = {
+        .w_recency    = 0.30f,
+        .w_attention  = 0.10f,
+        .w_frequency  = 0.15f,
+        .w_query      = 0.10f,
+        .w_pin        = 0.20f,
+        .w_redundancy = 0.30f,
+        .tau_r        = 4096.0f,
+        .lambda_a     = 0.95f,
+        .gamma        = 2.0f,
+    },
+    .tq_bits = { 5, 5, 4, 4, 2, 2 },
+};
+
+const smart_kv_tq_profile SMART_KV_TQ_UNITY_ULTRA = {
+    .name = "unity-ultra",
+    .weights = {
+        .w_recency    = 0.25f,
+        .w_attention  = 0.05f,
+        .w_frequency  = 0.10f,
+        .w_query      = 0.05f,
+        .w_pin        = 0.15f,
+        .w_redundancy = 0.35f,
+        .tau_r        = 2048.0f,
+        .lambda_a     = 0.95f,
+        .gamma        = 2.0f,
+    },
+    .tq_bits = { 2, 2, 2, 2, 2, 2 },
+};
+
+void smart_kv_apply_tq_profile(smart_kv_config * cfg, const smart_kv_tq_profile * profile) {
+    if (!cfg || !profile) return;
+    cfg->weights = profile->weights;
+    smart_kv_init_weights(&cfg->weights, cfg->weights.gamma);
+    // tq_bits are stored in the profile; caller copies them to the plugin's config
+}
 
 void smart_kv_init_weights(smart_kv_weights * w, float gamma) {
     float t[SMART_KV_TIER_COUNT] = { 0.80f, 0.55f, 0.32f, 0.18f, 0.08f };
@@ -302,6 +392,7 @@ smart_kv_prefill_hint smart_kv_prefill_analyze(const char * text, uint32_t len) 
 
 int smart_kv_tier_to_type(smart_kv_tier tier, int base_type) {
     if (tier == SMART_KV_TIER_ULTRA_TQ) return -1; // CPU offload via TQ plugin
+    if (tier < 1 || tier > SMART_KV_TIER_COUNT) return base_type;
     static const int steps[SMART_KV_TIER_COUNT] = { 0, 1, 3, 5, 7, 9 };
     int bi = find_qidx(base_type);
 
@@ -311,6 +402,7 @@ int smart_kv_tier_to_type(smart_kv_tier tier, int base_type) {
         // Default: just use the mid-point as VH and step down from there
         int fallback = (int)QTABLE_LEN / 2;
         int ti = fallback + steps[tier - 1];
+        if (ti < 0) ti = 0;
         if (ti >= (int)QTABLE_LEN) ti = (int)QTABLE_LEN - 1;
         return qtable[ti].type;
     }
@@ -321,6 +413,7 @@ int smart_kv_tier_to_type(smart_kv_tier tier, int base_type) {
     }
 
     int ti = bi + steps[tier - 1];
+    if (ti < 0) ti = 0;
     if (ti >= (int)QTABLE_LEN) ti = (int)QTABLE_LEN - 1;
     return qtable[ti].type;
 }
@@ -356,6 +449,8 @@ const char * smart_kv_tag_name(uint8_t tag) {
 smart_kv_scored_chunk smart_kv_eval(const smart_kv_chunk_meta * c, uint64_t now,
     uint32_t max_access, const smart_kv_config * cfg)
 {
+    smart_kv_scored_chunk r = { .tier = SMART_KV_TIER_BALANCED, .target_type = -1, .priority = 0.5f };
+    if (!c || !cfg) return r;
     float p = smart_kv_score(c, now, max_access, &cfg->weights);
     float gamma = smart_kv_adaptive_gamma(cfg->weights.gamma, cfg->memory_used, cfg->memory_capacity);
     smart_kv_weights adj = cfg->weights;
@@ -363,7 +458,9 @@ smart_kv_scored_chunk smart_kv_eval(const smart_kv_chunk_meta * c, uint64_t now,
         smart_kv_init_weights(&adj, gamma);
     }
     smart_kv_tier t = smart_kv_assign_tier(p, c->min_tier, adj.priority_thresholds);
-    smart_kv_scored_chunk r = { .tier = t, .target_type = smart_kv_tier_to_type(t, cfg->base_type), .priority = p };
+    r.tier = t;
+    r.target_type = smart_kv_tier_to_type(t, cfg->base_type);
+    r.priority = p;
     return r;
 }
 

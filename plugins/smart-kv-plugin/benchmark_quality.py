@@ -36,7 +36,7 @@ import argparse
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_URL = "http://127.0.0.1:12345"
-SERVER_EXE = os.path.join(BASE_DIR, "llama.cpp", "build", "bin", "llama-server.exe")
+SERVER_EXE = r"C:\Users\armor\Desktop\llamma.cpp server\llama.cpp\build\bin\llama-server.exe"
 MODEL_DIR = BASE_DIR
 START_BAT = os.path.join(BASE_DIR, "start.bat")
 
@@ -186,6 +186,7 @@ def start_server(profile_id, model_name=None, cache_override=None):
             print("  No .gguf model found")
             return False
         model = ggufs[0]
+    model = os.path.abspath(model)
 
     # Build command
     plugin_args = ""
@@ -217,26 +218,40 @@ def start_server(profile_id, model_name=None, cache_override=None):
             env["LLAMA_PLUGIN_FILE"] = os.path.join(BASE_DIR, "plugins.env")
     else:
         env = os.environ.copy()
+    env["HIP_VISIBLE_DEVICES"] = "1"  # select discrete GPU over integrated
 
-    cmd_str = " ".join(cmd)
+    cmd_str = subprocess.list2cmdline(cmd)
     print(f"  Starting: {os.path.basename(model)} @ {cfg['ctx']} ctx")
     print(f"  Cache: {cfg['cache']}")
     print(f"  Plugin: {cfg['plugin'] or 'none'}")
+    import sys; sys.stdout.flush()
 
     # Launch server
-    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             creationflags=subprocess.CREATE_NO_WINDOW)
 
     # Wait for server ready
     deadline = time.time() + 120
     while time.time() < deadline:
         if server_running():
+            # Drain startup output
+            try:
+                proc.stdout.read(1024)  # drain to avoid pipe block
+            except: pass
             print("  Server ready")
             return True
+        # Check if process died
+        if proc.poll() is not None:
+            out, err = proc.communicate(timeout=5)
+            print(f"  Server exited (code {proc.returncode})")
+            if err: print(f"  Error: {err[:200].decode(errors='replace')}")
+            if out: print(f"  Output: {out[:500].decode(errors='replace')}")
+            return False
         time.sleep(2)
 
-    print("  Server did not start")
+    print("  Server did not start (timeout)")
     proc.kill()
+    proc.wait(5)
     return False
 
 

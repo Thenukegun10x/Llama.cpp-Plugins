@@ -5,3 +5,8 @@
 !/README.md
 !/LICENSE
 !/plugins.env
+!/PLUGIN_PATCHER_DESIGN.md
+!/tools
+!/tools/**
+/tools/**/__pycache__/
+/tools/**/*.pyc
