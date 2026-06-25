@@ -1,0 +1,19 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\armor\Desktop\llamma.cpp server\plugins\turbo-quant-plugin\turbo_quant_plugin.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="C:\Users\armor\Desktop\llamma.cpp server\plugins\turbo-quant-plugin\turboquant.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\armor\Desktop\llamma.cpp server\plugins\turbo-quant-plugin\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{8504B624-C0D8-3A57-95CF-B0563E471B8B}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
