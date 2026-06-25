@@ -14,7 +14,7 @@ Unofficial plugin system for [llama.cpp](https://github.com/ggerganov/llama.cpp)
 
 Plugins are loaded at runtime via `plugins.env` or the `LLAMA_PLUGIN_FILE` environment variable on Windows. Each plugin lives in its own folder under `plugins/` and contains the compiled DLL alongside source files and documentation.
 
-- `plugins.env` — specifies which DLLs to load
+- `plugins.env` — specifies which DLLs to load **and the order they are loaded**
 - `LLAMA_PLUGIN_FILE` — alternative env var pointing to a plugin list file
 - Avoid `LLAMA_PLUGIN_PATH` on Windows due to drive-letter colons causing parse issues
 
