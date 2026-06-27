@@ -8,5 +8,6 @@
 !/PLUGIN_PATCHER_DESIGN.md
 !/tools
 !/tools/**
+!/start.bat
 /tools/**/__pycache__/
 /tools/**/*.pyc
