@@ -29,8 +29,10 @@ if /i "%1"=="" (
     echo Available presets:
     echo   start default  - FP8 kv cache
     echo   start f16      - F16 kv cache
-    echo   start smart    - Smart-KV plugin (TQ tiers)
-    echo   start fp8smart - FP8 + Smart-KV
+    echo   start smart    - Smart-KV plugin (balanced profile)
+    echo   start f16smart - F16 + Smart-KV Ultra
+    echo   start fp8smart - FP8 + Smart-KV Ultra
+    echo   start test     - F16 + train mode (dump ring buffer)
     echo.
     set PRESET=default
 ) else (
@@ -51,9 +53,17 @@ if /i "!PRESET!"=="f16" (
 )
 
 if /i "!PRESET!"=="smart" (
-    echo [Preset: Smart-KV plugin]
+    echo [Preset: Smart-KV plugin (balanced)]
     set SMART_KV_FP8=0
     set SMART_KV_PROFILE=balanced
+    "%~dp0llama.cpp\build\bin\llama-server.exe" -m "!MODEL!" ^
+     --plugin-kv-cache on --plugin-attn off %COMMON%
+)
+
+if /i "!PRESET!"=="f16smart" (
+    echo [Preset: F16 + Smart-KV Ultra]
+    set SMART_KV_FP8=0
+    set SMART_KV_PROFILE=ultra
     "%~dp0llama.cpp\build\bin\llama-server.exe" -m "!MODEL!" ^
      --plugin-kv-cache on --plugin-attn off %COMMON%
 )
@@ -65,5 +75,14 @@ if /i "!PRESET!"=="fp8smart" (
     set FP8_KV_ENABLE=1
     "%~dp0llama.cpp\build\bin\llama-server.exe" -m "!MODEL!" ^
      --cache-type-k f8_e4m3 --cache-type-v f8_e4m3 --no-warmup ^
+     --plugin-kv-cache on --plugin-attn off %COMMON%
+)
+
+if /i "!PRESET!"=="test" (
+    echo [Preset: F16 + Training Mode (dump ring buffer)]
+    set SMART_KV_TRAIN_MODE=1
+    set SMART_KV_SNAPSHOT_EXPORTS=1
+    set SMART_KV_PROFILE=balanced
+    "%~dp0llama.cpp\build\bin\llama-server.exe" -m "!MODEL!" ^
      --plugin-kv-cache on --plugin-attn off %COMMON%
 )
