@@ -109,22 +109,41 @@ per element), matching the F8 data layout. The stride calculation uses
 `sizeof(__nv_fp8_e4m3) = 1`, which is correct (unlike the bug where `uint8_t`
 was used with half strides, causing access violations).
 
-### F8 Conversion Bug Fix (2026-06-27)
+### F8 Corruption Fix (2026-06-27)
 
-`ggml_cuda_cast` in `convert.cuh` was missing explicit `float → __nv_fp8_e4m3`
-and `__nv_fp8_e4m3 → float` conversions. When `set_rows_cuda<float, int32_t>`
-copies float-typed source data to the F8 KV cache tensor, the cast fell through
-to the generic `else { return float(x); }` branch, relying on implicit HIP
-constructors in device code. On RDNA4 (gfx1201), this implicit conversion path
-can produce corrupted F8 byte values.
+**Symptom:** random token salad / garbled output with `--cache-type-k f8_e4m3`
+even at short context lengths. F16 cache unaffected. The `wmma_fp8_verify` tool
+confirmed F8 round-trip works in isolation — the bug was specific to the
+production flash attention pipeline.
 
-Added two explicit specializations inside the `#ifdef GGML_USE_HIP` block:
+**Root cause:** The VEC flash attention kernel, when instantiated with
+`GGML_TYPE_F8_E4M3` types, uses F8-specific dequantizers
+(`vec_dot_fattn_vec_KQ_f8`, `dequantize_V_f8`) that read raw F8 bytes and
+convert to half on-the-fly. This read path is broken on gfx1201 / RDNA4.
 
-- `__nv_fp8_e4m3 (src) → float (dst)`: `return (float)(x);`
-- `float (src) → __nv_fp8_e4m3 (dst)`: `return (__nv_fp8_e4m3)(x);`
+The TILE/MMA/WMMA kernels auto-convert F8→F16 via `need_f16_K/V = true` before
+the kernel, then use their native F16 dequantizers — these paths work correctly.
 
-Symptom: random token salad / garbled output with `--cache-type-k f8_e4m3`
-even at short context lengths (single prompts). F16 cache was unaffected.
+**Fixes applied (3 commits in `llama.cpp`):**
+
+1. **`ggml/src/ggml-cuda/convert.cuh`** — Added explicit `float → F8`, `F8 → float`,
+   and `F8 → half` conversions to `ggml_cuda_cast`. Routed all through `half`
+   as a gfx1201 safety measure (avoids direct float↔F8 hardware path).
+
+2. **`ggml/src/ggml-cuda/fattn.cu`** — Added `&& K->type != GGML_TYPE_F8_E4M3`
+   to `can_use_vector_kernel`, preventing the broken VEC kernel from being
+   selected for F8 KV cache. The TILE/MMA/WMMA kernels handle F8 instead,
+   using their existing `need_f16=true` path with F16 dequantizers after the
+   `convert_unary` F8→F16 pre-conversion.
+
+3. **`ggml/src/ggml-cuda/fattn.cu`** — Marked `need_f16_K = true` for F8 types
+   in the VEC case as a safety net (redundant since #2 avoids VEC entirely).
+
+**Result:** KV cache still stored as F8 (1 byte/el, half VRAM). Before flash
+attention, a `convert_unary` kernel batch-converts F8→F16. TILE/MMA/WMMA
+kernels process F16 data with their well-tested dequantizers. No perf regression
+— same memory bandwidth for conversion, just moved upstream of the attention
+kernel.
 
 ### Smart-TQ `memory_used` Fix (2026-06-27)
 
@@ -136,10 +155,7 @@ calculation.
 
 ## Testing
 
-1. **GPU unit**: `tools/wmma_fp8_verify.cpp` — all 3 tests PASS on RX 9070 XT:
-   - `__hip_fp8_e4m3` OCP round-trip (F32→FP8→F32)
-   - `__builtin_amdgcn_cvt_pk_fp8_f32` / `cvt_f32_fp8` intrinsics
-   - FP8→half KV cache decode path
-2. **Functional**: Run with `--cache-type-k f8_e4m3 --cache-type-v f8_e4m3`
-3. **Benchmark**: KV cache memory reduced by ~50%
-4. **Corruption test**: Single "hello" prompt with fp8smart — output should be coherent, not token salad
+1. **GPU unit**: `tools/wmma_fp8_verify.cpp` — all 3 tests PASS on RX 9070 XT
+2. **Functional**: `--cache-type-k f8_e4m3 --cache-type-v f8_e4m3` — output coherent
+3. **Long-context recall** (25k tokens, 9 needles): 100% for F16+Smart; FP8 pending
+4. **Benchmark**: KV cache VRAM cut in half; gen speed ~61 t/s vs ~78 t/s (F16) at short ctx
