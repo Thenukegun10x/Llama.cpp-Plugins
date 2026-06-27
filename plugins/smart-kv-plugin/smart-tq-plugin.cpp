@@ -106,8 +106,10 @@ struct SmartTQContext {
     uint64_t n_tq_row_frees;
     uint64_t n_tier6_stored;
     uint64_t n_tier6_retrieved;
+    uint64_t n_compress_events;
+    uint64_t n_compress_slots;
 
-    SmartTQContext() : fp8_active(false), n_train_samples(0), n_total_tier_decisions(0), n_tq_row_allocs(0), n_tq_row_frees(0), n_tier6_stored(0), n_tier6_retrieved(0), cached_max_access(0), train_ring(NULL) {
+    SmartTQContext() : fp8_active(false), n_train_samples(0), n_total_tier_decisions(0), n_tq_row_allocs(0), n_tq_row_frees(0), n_tier6_stored(0), n_tier6_retrieved(0), n_compress_events(0), n_compress_slots(0), cached_max_access(0), train_ring(NULL) {
         memset(n_tier_decisions, 0, sizeof(n_tier_decisions));
     }
 };
@@ -852,8 +854,12 @@ static void compress_cold_slots(SmartTQContext* ctx) {
         ctx->chunks[slot].n_tokens = 0;
     }
 
-    fprintf(stderr, "[smart-tq] compressed %d cold slots at pos %lld (cold=%.3f, pressure=%.1f%%)\n",
-            g_compress_block, (long long)best_start, best_cold, pressure * 100.0f);
+    ctx->n_compress_events++;
+    ctx->n_compress_slots += g_compress_block;
+    fprintf(stderr, "[smart-tq] compression event #%llu: freed %d slots at pos %lld (cold=%.3f, pressure=%.1f%%, total freed=%llu)\n",
+            (unsigned long long)ctx->n_compress_events,
+            g_compress_block, (long long)best_start, best_cold, pressure * 100.0f,
+            (unsigned long long)ctx->n_compress_slots);
 }
 
 // ── kv_cache_store ──────────────────────────────────────────────────

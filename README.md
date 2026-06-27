@@ -41,6 +41,7 @@ Two MLP models trained from heuristic teacher labels:
 |-----|---------|-------------|
 | `SMART_KV_PROFILE` | `balanced` | Tier profile: `high`, `balanced`, `perf`, `ultra` |
 | `SMART_KV_FP8` | `0` | Set `1` for FP8 GPU tensors (needs `--cache-type-k f8_e4m3`) |
+| `SMART_KV_COMPRESS` | `0` | Set `1` to enable context compression (see below) |
 | `SMART_KV_TRAIN_MODE` | `0` | Set `1` to collect training data (ring buffer → export) |
 | `SMART_KV_SNAPSHOT_EXPORTS` | `0` | Periodic training data exports |
 | `SMART_KV_EXPORT_DIR` | *(plugin dir)* | Export path for training data |
@@ -53,6 +54,43 @@ Two MLP models trained from heuristic teacher labels:
 | `balanced` | 1.00 | 0.85 | Default |
 | `perf` / `performance` | 1.50 | 0.75 | More aggressive offload |
 | `ultra` | 2.00 | 0.65 | Max VRAM efficiency |
+
+### Context Compression (`SMART_KV_COMPRESS=1`)
+
+When the KV cache fills past a tunable threshold, the plugin drops the
+coldest contiguous block of slots to free up space — **without losing recent
+context or attention sinks**. The model continues to see the full `n_ctx`,
+but dropped slots contain zeros (which softmax ignores).
+
+**Benefits:**
+- Prevents OOM at long context by freeing cold slots before pressure hits 100%
+- No quality loss: only slots with low attention_ema + low access count + old last_used_step are dropped
+- Transparent to harnesses — they still see `n_ctx` unchanged
+- Works alongside all other features (FP8, TQ, tiers)
+
+**When to use:**
+- Long-running agent loops (hundreds of turns)
+- Contexts approaching 80%+ KV fill
+- Combined with `fp8compress` preset for max context density
+
+**Tuning knobs** (env vars):
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `SMART_KV_COMPRESS` | `0` | Enable context compression |
+| `SMART_KV_COMPRESS_PRESSURE` | `0.80` | Start compressing at this fill fraction |
+| `SMART_KV_COMPRESS_BLOCK` | `4` | Slots to free per compression event |
+| `SMART_KV_COMPRESS_SINKS` | `4` | First N slots preserved as attention sinks |
+| `SMART_KV_COMPRESS_INTERVAL` | `256` | Check compression every N tier decisions |
+| `SMART_KV_COMPRESS_THRESHOLD` | `0.70` | Coldness threshold (0-1) — higher = fewer drops |
+
+**Example — compress aggressively at 70% fill:**
+```bat
+set SMART_KV_COMPRESS=1
+set SMART_KV_COMPRESS_PRESSURE=0.70
+set SMART_KV_COMPRESS_BLOCK=16
+set SMART_KV_COMPRESS_THRESHOLD=0.50
+```
 
 ---
 
@@ -127,18 +165,19 @@ llama-server
 
 ## Available presets (`start.bat`)
 
-| Preset | KV Cache | Plugin | Profile | Context |
-|--------|----------|--------|---------|---------|
-| `default` / `fp8` | F8 | None | — | 32k |
-| `f16` | F16 | None | — | 32k |
-| `smart` | F16 | Smart-KV | balanced | 32k |
-| `f16smart` | F16 | Smart-KV | ultra | 32k |
-| `fp8smart` | F8 | Smart-KV | ultra | 32k |
-| `fp8balanced` | F8 | Smart-KV | balanced | 32k |
-| `fp8aggressive` | F8 | Smart-KV | perf | 32k |
-| `fp8max` | F8 | Smart-KV | ultra | **128k** |
-| `fp8train` | F8 | Smart-KV | balanced | 32k |
-| `test` / `train` | F16 | Smart-KV | balanced | 32k |
+| Preset | KV Cache | Plugin | Profile | Context | Compression |
+|--------|----------|--------|---------|---------|-------------|
+| `default` / `fp8` | F8 | None | — | 32k | No |
+| `f16` | F16 | None | — | 32k | No |
+| `smart` | F16 | Smart-KV | balanced | 32k | No |
+| `f16smart` | F16 | Smart-KV | ultra | 32k | No |
+| `fp8smart` | F8 | Smart-KV | ultra | 32k | No |
+| `fp8compress` | F8 | Smart-KV | ultra | 32k | **Yes** |
+| `fp8balanced` | F8 | Smart-KV | balanced | 32k | No |
+| `fp8aggressive` | F8 | Smart-KV | perf | 32k | No |
+| `fp8max` | F8 | Smart-KV | ultra | **128k** | No |
+| `fp8train` | F8 | Smart-KV | balanced | 32k | No |
+| `test` / `train` | F16 | Smart-KV | balanced | 32k | No |
 
 ---
 
@@ -150,10 +189,13 @@ llama-server
 | F8 no plugin | 5771 t/s | 72.1 t/s | ~33 t/s | — | — |
 | F16 + Smart-KV | — | 76.1 t/s | 32.4 t/s | 7155 MiB | 7313 MiB (+158 MiB) |
 | F8 + Smart-KV | — | 61.9 t/s | 32.5 t/s | 6931 MiB | — |
+| **F8 + Smart-KV + Compress** | — | — | — | **6764 MiB** | 6923 MiB (+159 MiB) |
 
 **Long-context recall (25k tokens, 9 needles):** 100% for all configs tested.
 
 FP8 uses **half the KV cache VRAM** of F16 (~10% generation overhead). Smart-KV plugin adds ~11% overhead for tier scoring. At long context (25k+), attention O(n²) dominates and all cache types converge to ~33 t/s.
+
+**Compression benefit:** F8 + Compress starts with **6764 MiB** vs 7155 MiB (F16) — a **391 MiB** VRAM saving from the pre-allocated KV tensor alone. Compression drops cold slots transparently when fill exceeds 80%, keeping recent context and sink anchors intact.
 
 ---
 
