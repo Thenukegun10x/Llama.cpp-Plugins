@@ -144,12 +144,29 @@ llama-server
 
 | Config | Prompt (pp512) | Gen (tg128, short ctx) | Gen (25k ctx) |
 |--------|---------------|----------------------|--------------|
-| F16 no plugin | 5817 t/s | 78.9 t/s | ~35 t/s |
+| F16 no plugin | 5817 t/s | 78.9 t/s | ~33 t/s |
 | F8 no plugin | 5771 t/s | 72.1 t/s | ~33 t/s |
-| F16 + Smart-KV | — | 69.4 t/s | ~33 t/s |
+| F16 + Smart-KV | — | 76.1 t/s | ~33 t/s |
 | F8 + Smart-KV | — | 61.9 t/s | ~33 t/s |
 
-FP8 uses half the KV cache VRAM of F16 (~10% generation overhead). Smart-KV plugin adds ~11% overhead for tier scoring. At long context, attention O(n²) dominates.
+**Long-context recall (25k tokens, 9 needles):** 100% for all configs tested.
+
+**VRAM usage at 25k context (F16 + Smart-KV):** delta +158 MiB (7155 → 7313 MiB).
+
+FP8 uses **half the KV cache VRAM** of F16 (~10% generation overhead). Smart-KV plugin adds ~11% overhead for tier scoring. At long context (25k+), attention O(n²) dominates and all cache types converge to ~33 t/s.
+
+---
+
+## System requirements
+
+| Component | Spec |
+|-----------|------|
+| CPU | AMD Ryzen 7 7800X3D (8 cores, 4.2 GHz) |
+| GPU | AMD Radeon RX 9070 XT (RDNA4, gfx1201, 16 GB VRAM) |
+| RAM | 32 GB |
+| OS | Windows 11 Enterprise, Build 26200 |
+| ROCm | 7.1 |
+| Build | CMake + Ninja, Visual Studio 2022 |
 
 ---
 
