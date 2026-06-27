@@ -63,6 +63,7 @@ if /i "!PRESET!"=="smart"       goto :SMART
 if /i "!PRESET!"=="f16smart"    goto :F16SMART
 if /i "!PRESET!"=="smartf16"    goto :F16SMART
 if /i "!PRESET!"=="fp8smart"    goto :FP8SMART
+if /i "!PRESET!"=="f8smart"     goto :FP8SMART
 if /i "!PRESET!"=="smartfp8"    goto :FP8SMART
 if /i "!PRESET!"=="fp8balanced" goto :FP8BALANCED
 if /i "!PRESET!"=="balancedfp8" goto :FP8BALANCED

@@ -109,6 +109,31 @@ per element), matching the F8 data layout. The stride calculation uses
 `sizeof(__nv_fp8_e4m3) = 1`, which is correct (unlike the bug where `uint8_t`
 was used with half strides, causing access violations).
 
+### F8 Conversion Bug Fix (2026-06-27)
+
+`ggml_cuda_cast` in `convert.cuh` was missing explicit `float → __nv_fp8_e4m3`
+and `__nv_fp8_e4m3 → float` conversions. When `set_rows_cuda<float, int32_t>`
+copies float-typed source data to the F8 KV cache tensor, the cast fell through
+to the generic `else { return float(x); }` branch, relying on implicit HIP
+constructors in device code. On RDNA4 (gfx1201), this implicit conversion path
+can produce corrupted F8 byte values.
+
+Added two explicit specializations inside the `#ifdef GGML_USE_HIP` block:
+
+- `__nv_fp8_e4m3 (src) → float (dst)`: `return (float)(x);`
+- `float (src) → __nv_fp8_e4m3 (dst)`: `return (__nv_fp8_e4m3)(x);`
+
+Symptom: random token salad / garbled output with `--cache-type-k f8_e4m3`
+even at short context lengths (single prompts). F16 cache was unaffected.
+
+### Smart-TQ `memory_used` Fix (2026-06-27)
+
+`free_tq_slot()` was called unconditionally for every non-TQ6 store, including
+slots that never had TQ data. Now only freed when `slot_tier == TQ6`, reducing
+superfluous branch execution. `memory_used` tracking already resets on
+`kv_cache_clear()` and correctly tracks cumulative occupancy for pressure
+calculation.
+
 ## Testing
 
 1. **GPU unit**: `tools/wmma_fp8_verify.cpp` — all 3 tests PASS on RX 9070 XT:
@@ -117,3 +142,4 @@ was used with half strides, causing access violations).
    - FP8→half KV cache decode path
 2. **Functional**: Run with `--cache-type-k f8_e4m3 --cache-type-v f8_e4m3`
 3. **Benchmark**: KV cache memory reduced by ~50%
+4. **Corruption test**: Single "hello" prompt with fp8smart — output should be coherent, not token salad

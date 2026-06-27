@@ -919,7 +919,10 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
             // ── Tier 1-5: store as F16 (GPU tensor handles this) ──
             // The GPU F16 tensor was already written by llama.cpp.
             // We just mark the slot as F16-tier.
-            free_tq_slot(ctx, slot);
+            if (ctx->slot_tier[slot] == SMART_KV_TIER_ULTRA_TQ) {
+                // Slot was previously TQ6 — now back on GPU, free CPU storage
+                free_tq_slot(ctx, slot);
+            }
             ctx->slot_tier[slot] = 0;  // 0 = GPU F16
         }
 
