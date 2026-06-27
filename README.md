@@ -177,27 +177,7 @@ llama-server
 | `fp8aggressive` | F8 | Smart-KV | perf | 32k | No |
 | `fp8max` | F8 | Smart-KV | ultra | **128k** | No |
 | `fp8train` | F8 | Smart-KV | balanced | 32k | No |
-| `test` / `train` | F16 | Smart-KV | balanced | 32k | No |
-
----
-
-## Benchmarks (RX 9070 XT, Qwen 3.5 4B Q8_0)
-
-| Config | Prompt (pp512) | Gen (tg128, short ctx) | Gen (25k ctx) | VRAM (idle) | VRAM (25k ctx) |
-|--------|---------------|----------------------|--------------|-------------|----------------|
-| F16 no plugin | 5817 t/s | 78.9 t/s | ~33 t/s | — | — |
-| F8 no plugin | 5771 t/s | 72.1 t/s | ~33 t/s | — | — |
-| F16 + Smart-KV | — | 76.1 t/s | 32.4 t/s | 7155 MiB | 7313 MiB (+158 MiB) |
-| F8 + Smart-KV | — | 61.9 t/s | 32.5 t/s | 6931 MiB | — |
-| **F8 + Smart-KV + Compress** | — | — | — | **6764 MiB** | 6923 MiB (+159 MiB) |
-
-**Long-context recall (25k tokens, 9 needles):** 100% for all configs tested.
-
-FP8 uses **half the KV cache VRAM** of F16 (~10% generation overhead). Smart-KV plugin adds ~11% overhead for tier scoring. At long context (25k+), attention O(n²) dominates and all cache types converge to ~33 t/s.
-
-**Compression benefit:** F8 + Compress starts with **6764 MiB** vs 7155 MiB (F16) — a **391 MiB** VRAM saving from the pre-allocated KV tensor alone. Compression drops cold slots transparently when fill exceeds 80%, keeping recent context and sink anchors intact.
-
----
+| `test` / `train` | F16 | Smart-KV | balanced | 32k | No |---
 
 ## System requirements
 
