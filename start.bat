@@ -65,6 +65,8 @@ if /i "!PRESET!"=="smartf16"    goto :F16SMART
 if /i "!PRESET!"=="fp8smart"    goto :FP8SMART
 if /i "!PRESET!"=="f8smart"     goto :FP8SMART
 if /i "!PRESET!"=="smartfp8"    goto :FP8SMART
+if /i "!PRESET!"=="fp8compress" goto :FP8COMPRESS
+if /i "!PRESET!"=="compressfp8" goto :FP8COMPRESS
 if /i "!PRESET!"=="fp8balanced" goto :FP8BALANCED
 if /i "!PRESET!"=="balancedfp8" goto :FP8BALANCED
 if /i "!PRESET!"=="fp8light"    goto :FP8BALANCED
@@ -93,6 +95,7 @@ echo   start.bat f16smart      - F16 + Smart-KV ultra
 echo.
 echo   FP8 + Smart-KV variants:
 echo   start.bat fp8smart      - FP8 + Smart-KV ultra ^(max quality^)
+echo   start.bat fp8compress   - FP8 + Smart-KV ultra + context compression
 echo   start.bat fp8balanced   - FP8 + Smart-KV balanced
 echo   start.bat fp8light      - same as fp8balanced
 echo   start.bat fp8aggressive - FP8 + Smart-KV ^(more tier 4 evictions^)
@@ -156,6 +159,15 @@ echo [Preset: FP8 + Smart-KV performance (aggressive eviction)]
 set "SMART_KV_FP8=1"
 set "SMART_KV_PROFILE=performance"
 set "FP8_KV_ENABLE=1"
+set "PRESET_ARGS=--cache-type-k f8_e4m3 --cache-type-v f8_e4m3 --no-warmup --plugin-kv-cache on --plugin-attn off"
+goto :LAUNCH
+
+:FP8COMPRESS
+echo [Preset: FP8 + Smart-KV ultra + context compression]
+set "SMART_KV_FP8=1"
+set "SMART_KV_PROFILE=ultra"
+set "FP8_KV_ENABLE=1"
+set "SMART_KV_COMPRESS=1"
 set "PRESET_ARGS=--cache-type-k f8_e4m3 --cache-type-v f8_e4m3 --no-warmup --plugin-kv-cache on --plugin-attn off"
 goto :LAUNCH
 

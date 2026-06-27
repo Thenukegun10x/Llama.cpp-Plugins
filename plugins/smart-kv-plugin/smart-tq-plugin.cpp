@@ -118,10 +118,16 @@ static bool g_loaded = false;
 static bool g_train_mode = false;
 static bool g_snapshot_exports = false;
 static bool g_fp8_mode = false;
+static bool g_compress_mode = false;
 static const char* g_profile_name = "balanced";
 static float g_offload_scale = 1.0f;
 static uint64_t g_stats_interval = 8192;
 static float g_ram_threshold = 0.80f;
+static float g_compress_pressure = 0.80f;    // start compressing at 80% fill
+static int   g_compress_block = 4;           // drop 4 slots at a time
+static int   g_compress_sinks = 4;           // keep first N slots as sink anchors
+static int   g_compress_interval = 256;      // check compression every N stores
+static float g_compress_threshold = 0.70f;   // coldness threshold (0-1) to trigger
 
 static void free_tq_slot(SmartTQContext* ctx, int64_t slot);
 static void free_all_tq_slots(SmartTQContext* ctx);
@@ -181,7 +187,34 @@ static void on_load(void) {
     const char* profile = getenv("SMART_KV_PROFILE");
     const char* fp8_env = getenv("SMART_KV_FP8");
     const char* stats_interval = getenv("SMART_KV_STATS_INTERVAL");
+    const char* compress_env = getenv("SMART_KV_COMPRESS");
+    const char* compress_pressure_env = getenv("SMART_KV_COMPRESS_PRESSURE");
+    const char* compress_block_env = getenv("SMART_KV_COMPRESS_BLOCK");
+    const char* compress_sinks_env = getenv("SMART_KV_COMPRESS_SINKS");
+    const char* compress_interval_env = getenv("SMART_KV_COMPRESS_INTERVAL");
+    const char* compress_threshold_env = getenv("SMART_KV_COMPRESS_THRESHOLD");
     g_fp8_mode = fp8_env && fp8_env[0] && strcmp(fp8_env, "0") != 0;
+    g_compress_mode = compress_env && compress_env[0] && strcmp(compress_env, "0") != 0;
+    if (compress_pressure_env && compress_pressure_env[0]) {
+        float v = (float)atof(compress_pressure_env);
+        if (v > 0.0f && v < 1.0f) g_compress_pressure = v;
+    }
+    if (compress_block_env && compress_block_env[0]) {
+        int v = atoi(compress_block_env);
+        if (v > 0 && v <= 256) g_compress_block = v;
+    }
+    if (compress_sinks_env && compress_sinks_env[0]) {
+        int v = atoi(compress_sinks_env);
+        if (v >= 0 && v <= 64) g_compress_sinks = v;
+    }
+    if (compress_interval_env && compress_interval_env[0]) {
+        int v = atoi(compress_interval_env);
+        if (v > 0) g_compress_interval = v;
+    }
+    if (compress_threshold_env && compress_threshold_env[0]) {
+        float v = (float)atof(compress_threshold_env);
+        if (v > 0.0f && v < 1.0f) g_compress_threshold = v;
+    }
     g_train_mode = train_mode && train_mode[0] && strcmp(train_mode, "0") != 0;
     g_snapshot_exports = snapshot_exports && snapshot_exports[0] && strcmp(snapshot_exports, "0") != 0;
     if (stats_interval && stats_interval[0]) {
@@ -222,6 +255,12 @@ static void on_load(void) {
     }
     if (g_snapshot_exports) {
         fprintf(stderr, "[smart-tq] snapshot exports enabled\n");
+    }
+    if (g_compress_mode) {
+        fprintf(stderr, "[smart-tq] context compression: enabled at %.0f%% fill, block=%d, sinks=%d, interval=%d, threshold=%.2f\n",
+                g_compress_pressure * 100.0f, g_compress_block, g_compress_sinks, g_compress_interval, g_compress_threshold);
+        fprintf(stderr, "[smart-tq]   tunables: SMART_KV_COMPRESS_PRESSURE=%.2f BLOCK=%d SINKS=%d INTERVAL=%d THRESHOLD=%.2f\n",
+                g_compress_pressure, g_compress_block, g_compress_sinks, g_compress_interval, g_compress_threshold);
     }
 }
 
@@ -743,6 +782,80 @@ static uint64_t collect_training_sample(SmartTQContext* ctx, int64_t slot, uint3
     return ++ctx->n_train_samples;
 }
 
+// ── Context compression ─────────────────────────────────────────────
+// Drops the coldest contiguous block of slots to free up context space.
+// Cold = low attention_ema + low access count + old last_used_step.
+// Preserves sink tokens (first N) and recent window (last 25%).
+
+static void compress_cold_slots(SmartTQContext* ctx) {
+    if (!ctx || !g_compress_mode) return;
+    if (ctx->kv_size < (int64_t)(g_compress_sinks + g_compress_block)) return;
+
+    float pressure = ctx->cfg.memory_capacity > 0
+        ? (float)ctx->cfg.memory_used / (float)ctx->cfg.memory_capacity : 0.0f;
+    if (pressure < g_compress_pressure) return;
+
+    // Find max access count for normalization
+    uint32_t max_access = 1;
+    for (int64_t i = g_compress_sinks; i < ctx->kv_size; i++) {
+        if (ctx->chunks[i].access_count > max_access)
+            max_access = ctx->chunks[i].access_count;
+    }
+
+    // Recent window: keep last 25% of slots
+    int64_t recent_start = ctx->kv_size - ctx->kv_size / 4;
+    if (recent_start < g_compress_sinks) recent_start = g_compress_sinks;
+
+    // Score each slot by coldness: low attention + low access + old
+    // Scan in the search region [g_compress_sinks, recent_start)
+    int64_t search_start = g_compress_sinks;
+    int64_t search_end   = recent_start;
+
+    // Find the contiguous block with the highest average coldness
+    int64_t best_start = search_start;
+    double  best_cold  = -1.0;
+
+    for (int64_t i = search_start; i <= search_end - g_compress_block; i++) {
+        double total_cold = 0.0;
+        for (int j = 0; j < g_compress_block; j++) {
+            smart_kv_chunk_meta* c = &ctx->chunks[i + j];
+            float norm_access = max_access > 0 ? (float)c->access_count / (float)max_access : 0.0f;
+            total_cold += (1.0f - c->attention_ema) * (1.0f - norm_access);
+        }
+        double avg = total_cold / g_compress_block;
+        if (avg > best_cold) {
+            best_cold  = avg;
+            best_start = i;
+        }
+    }
+
+    // Only compress if cold enough (tunable via SMART_KV_COMPRESS_THRESHOLD)
+    if (best_cold < g_compress_threshold) return;
+
+    // Drop the block
+    for (int j = 0; j < g_compress_block; j++) {
+        int64_t slot = best_start + j;
+        if (slot >= ctx->kv_size) break;
+
+        free_tq_slot(ctx, slot);
+        ctx->slot_tier[slot] = 0;
+        if (ctx->chunks[slot].access_count > 0 && ctx->cfg.memory_used > 0) {
+            ctx->cfg.memory_used--;
+        }
+        // Reset chunk metadata
+        ctx->chunks[slot].access_count = 0;
+        ctx->chunks[slot].attention_ema = 0.5f;
+        ctx->chunks[slot].query_score = 0.5f;
+        ctx->chunks[slot].k_norm = 0.0f;
+        ctx->chunks[slot].v_norm = 0.0f;
+        ctx->chunks[slot].k_variance = 0.0f;
+        ctx->chunks[slot].n_tokens = 0;
+    }
+
+    fprintf(stderr, "[smart-tq] compressed %d cold slots at pos %lld (cold=%.3f, pressure=%.1f%%)\n",
+            g_compress_block, (long long)best_start, best_cold, pressure * 100.0f);
+}
+
 // ── kv_cache_store ──────────────────────────────────────────────────
 
 static int kv_cache_store(void* layer_ctx, int64_t pos,
@@ -819,6 +932,11 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
             if (g_stats_interval > 0 && (ctx->n_total_tier_decisions % g_stats_interval) == 0) {
                 dump_stats(ctx, "live");
             }
+        }
+
+        // Context compression: periodically drop cold slots when cache is full
+        if (g_compress_mode && (ctx->n_total_tier_decisions % g_compress_interval) == 0) {
+            compress_cold_slots(ctx);
         }
 
         // Collect training data: sample current slot always, cold slots near write cursor
