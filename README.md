@@ -2,6 +2,8 @@
 
 Unofficial plugin system for [llama.cpp](https://github.com/ggerganov/llama.cpp) on Windows/ROCm, providing loadable runtime DLLs that extend server functionality — tiered KV-cache eviction, FP8 tensor compression, flash attention, and more.
 
+> **⚠ Work in progress.** All plugins are experimental — expect rough edges, incomplete features, and breaking changes. Not production-ready.
+
 ---
 
 ## Quick Start
@@ -142,16 +144,14 @@ llama-server
 
 ## Benchmarks (RX 9070 XT, Qwen 3.5 4B Q8_0)
 
-| Config | Prompt (pp512) | Gen (tg128, short ctx) | Gen (25k ctx) |
-|--------|---------------|----------------------|--------------|
-| F16 no plugin | 5817 t/s | 78.9 t/s | ~33 t/s |
-| F8 no plugin | 5771 t/s | 72.1 t/s | ~33 t/s |
-| F16 + Smart-KV | — | 76.1 t/s | ~33 t/s |
-| F8 + Smart-KV | — | 61.9 t/s | ~33 t/s |
+| Config | Prompt (pp512) | Gen (tg128, short ctx) | Gen (25k ctx) | VRAM (idle) | VRAM (25k ctx) |
+|--------|---------------|----------------------|--------------|-------------|----------------|
+| F16 no plugin | 5817 t/s | 78.9 t/s | ~33 t/s | — | — |
+| F8 no plugin | 5771 t/s | 72.1 t/s | ~33 t/s | — | — |
+| F16 + Smart-KV | — | 76.1 t/s | 32.4 t/s | 7155 MiB | 7313 MiB (+158 MiB) |
+| F8 + Smart-KV | — | 61.9 t/s | 32.5 t/s | 6931 MiB | — |
 
 **Long-context recall (25k tokens, 9 needles):** 100% for all configs tested.
-
-**VRAM usage at 25k context (F16 + Smart-KV):** delta +158 MiB (7155 → 7313 MiB).
 
 FP8 uses **half the KV cache VRAM** of F16 (~10% generation overhead). Smart-KV plugin adds ~11% overhead for tier scoring. At long context (25k+), attention O(n²) dominates and all cache types converge to ~33 t/s.
 
