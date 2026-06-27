@@ -15,30 +15,31 @@ extern "C" {
 // Two independent tiny MLPs replacing the old single-score approach:
 //
 // QuantRegressor: assigns quant tier within GPU VRAM (tiers 1-5)
-//   Input(21) → Linear(16) → ReLU → Linear(1) → Sigmoid → score
-//   Params: 21*16 + 16 + 16*1 + 1 = 369
+//   Input(23) → Linear(16) → ReLU → Linear(1) → Sigmoid → score
+//   Params: 23*16 + 16 + 16*1 + 1 = 401
 //
 // RAMDemoter: decides whether to evict to CPU RAM (tier 6)
-//   Input(22) → Linear(8) → ReLU → Linear(1) → Sigmoid → probability
-//   Params: 22*8 + 8 + 8*1 + 1 = 193
+//   Input(24) → Linear(8) → ReLU → Linear(1) → Sigmoid → probability
+//   Params: 24*8 + 8 + 8*1 + 1 = 209
 //
-// Combined: ~562 params, ~2.2 KB, ~1μs forward pass
+// Combined: ~610 params, ~2.4 KB, ~1μs forward pass
 //
-// Input features (21 base):
+// Input features (23 base):
 //   recency_log, frequency_log, attention_ema, query_score,
 //   tag_onehot[10], redundancy_score, chunk_age_ratio, pinned, gamma,
-//   k_norm, v_norm, k_variance
+//   k_norm, v_norm, k_variance,
+//   promotion_count_log, recently_promoted
 //
 // RAMDemoter gets 1 extra: memory_pressure
 
 // ── QuantRegressor (tier 1-5) ─────────────────────────────────────────
 
-#define QR_IN_DIM   21
+#define QR_IN_DIM   23
 #define QR_HID_DIM  16
 #define QR_OUT_DIM  1
 
 typedef struct {
-    float w1[QR_IN_DIM * QR_HID_DIM];  // [21][16]
+    float w1[QR_IN_DIM * QR_HID_DIM];  // [23][16]
     float b1[QR_HID_DIM];              // [16]
     float w2[QR_HID_DIM * QR_OUT_DIM]; // [16][1]
     float b2[QR_OUT_DIM];              // [1]
@@ -46,12 +47,12 @@ typedef struct {
 
 // ── RAMDemoter (tier 6 binary) ───────────────────────────────────────
 
-#define RD_IN_DIM   22   // 21 base + memory_pressure
+#define RD_IN_DIM   24   // 23 base + memory_pressure
 #define RD_HID_DIM  8
 #define RD_OUT_DIM  1
 
 typedef struct {
-    float w1[RD_IN_DIM * RD_HID_DIM];  // [22][8]
+    float w1[RD_IN_DIM * RD_HID_DIM];  // [24][8]
     float b1[RD_HID_DIM];              // [8]
     float w2[RD_HID_DIM * RD_OUT_DIM]; // [8][1]
     float b2[RD_OUT_DIM];              // [1]
@@ -66,7 +67,7 @@ typedef struct {
     bool              quant_loaded; // true if quant weights successfully loaded
 } learned_scorer_t;
 
-// ── Input features (21 base + 1 optional for RAM) ────────────────────
+// ── Input features (23 base + 1 optional for RAM) ────────────────────
 
 typedef struct {
     float recency_log;          // log(now - last_used + 1) / 16
@@ -83,6 +84,10 @@ typedef struct {
     float k_norm;               // running mean L2 norm(K) / sqrt(head_dim)
     float v_norm;               // running mean L2 norm(V) / sqrt(head_dim)
     float k_variance;           // running variance of K norms across tokens in chunk
+
+    // Promotion tracking — prevents tier-6 ping-pong
+    float promotion_count_log;  // log(promotion_count + 1) / 4 (0-1, 0 = never promoted)
+    float recently_promoted;    // 1.0 if promotion within last 256 steps, else 0.0
 } ls_features_t;
 
 // ── Forward: QuantRegressor ──────────────────────────────────────────
@@ -103,6 +108,8 @@ static inline float qr_forward(const quant_regressor_t * m, const ls_features_t 
     x[idx++] = f->k_norm;
     x[idx++] = f->v_norm;
     x[idx++] = f->k_variance;
+    x[idx++] = f->promotion_count_log;
+    x[idx++] = f->recently_promoted;
 
     // Layer 1: h = ReLU(x W1 + b1)
     float h[QR_HID_DIM];
@@ -124,7 +131,7 @@ static inline float qr_forward(const quant_regressor_t * m, const ls_features_t 
 
 // ── Forward: RAMDemoter ──────────────────────────────────────────────
 // Returns probability 0-1 (>0.5 → evict to CPU RAM)
-// Extra feature: memory_pressure (0-1) appended after the 21 base features
+// Extra feature: memory_pressure (0-1) appended after the 23 base features
 
 static inline float rd_forward(const ram_demoter_t * m, const ls_features_t * f, float memory_pressure) {
     float x[RD_IN_DIM];
@@ -141,7 +148,9 @@ static inline float rd_forward(const ram_demoter_t * m, const ls_features_t * f,
     x[idx++] = f->k_norm;
     x[idx++] = f->v_norm;
     x[idx++] = f->k_variance;
-    x[idx++] = memory_pressure;  // 22nd feature
+    x[idx++] = f->promotion_count_log;
+    x[idx++] = f->recently_promoted;
+    x[idx++] = memory_pressure;  // 24th feature
 
     // Layer 1: h = ReLU(x W1 + b1)
     float h[RD_HID_DIM];
@@ -189,6 +198,8 @@ static inline ls_result_t ls_eval(const learned_scorer_t * ls, const ls_features
 
 #include "smart-kv-cache.h"
 
+#define LS_PROMOTION_WINDOW 256
+
 static inline ls_features_t ls_features_from_meta(const smart_kv_chunk_meta * c,
     uint64_t now, uint32_t context_len, float gamma)
 {
@@ -211,6 +222,11 @@ static inline ls_features_t ls_features_from_meta(const smart_kv_chunk_meta * c,
     f.k_norm           = c->k_norm;
     f.v_norm           = c->v_norm;
     f.k_variance       = c->k_variance;
+
+    f.promotion_count_log = logf((float)(c->promotion_count + 1)) / 4.0f;
+    if (f.promotion_count_log > 1.0f) f.promotion_count_log = 1.0f;
+
+    f.recently_promoted = (now - c->last_promotion_step) < LS_PROMOTION_WINDOW ? 1.0f : 0.0f;
 
     uint8_t tag = c->tag;
     if (tag < 10) f.tag_onehot[tag] = 1.0f;
@@ -284,7 +300,7 @@ static inline void ls_ring_fixup_labels(ls_ring_buffer_t * rb,
 }
 
 // ── Export dataset for Python training ────────────────────────────────
-// Format: [header: float n_samples, float n_features=21] [X: n × 21 floats]
+// Format: [header: float n_samples, float n_features=23] [X: n × 23 floats]
 //         [y_quant: n × 1 float] [y_ram: n × 1 float] [mem_pressure: n × 1 float]
 //
 // Call ls_ring_fixup_labels() first to get correct counterfactual RAM labels.
@@ -314,6 +330,8 @@ static inline int ls_export_dataset(const char * path, const ls_ring_buffer_t * 
         row[idx++] = f->k_norm;
         row[idx++] = f->v_norm;
         row[idx++] = f->k_variance;
+        row[idx++] = f->promotion_count_log;
+        row[idx++] = f->recently_promoted;
         fwrite(row, sizeof(float), QR_IN_DIM, fp);
     }
 
@@ -340,7 +358,7 @@ static inline int ls_export_dataset(const char * path, const ls_ring_buffer_t * 
 }
 
 // ── Load QuantRegressor weights from binary ───────────────────────────
-// File format: [w1: 17*16=272 floats] [b1: 16 floats]
+// File format: [w1: 23*16=368 floats] [b1: 16 floats]
 //              [w2: 16*1=16 floats] [b2: 1 float]
 
 static inline int ls_load_quant_weights(const char * path, quant_regressor_t * m) {
@@ -359,7 +377,7 @@ static inline int ls_load_quant_weights(const char * path, quant_regressor_t * m
 }
 
 // ── Load RAMDemoter weights from binary ──────────────────────────────
-// File format: [w1: 18*8=144 floats] [b1: 8 floats]
+// File format: [w1: 24*8=192 floats] [b1: 8 floats]
 //              [w2: 8*1=8 floats] [b2: 1 float]
 
 static inline int ls_load_ram_weights(const char * path, ram_demoter_t * m) {

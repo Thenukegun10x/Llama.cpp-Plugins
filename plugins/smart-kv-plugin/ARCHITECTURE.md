@@ -1,297 +1,400 @@
-# StratumCache — Architecture & Plan
+# Smart KV Cache — Architecture
 
 ## Overview
 
-Scoring-based tiered KV cache with learned MLP models for llama.cpp.
-Two independent decision models replace the old single-score approach:
+Scoring-based tiered KV cache with learned MLP models for the smart-tq-plugin in llama.cpp. Two independent decision models replace the old heuristic-only approach:
 
 ```
-Input Features (17+)
+Input Features (23-dim)
      │
-     ├──► QuantRegressor ──► quant tier (1-5) or qtable index (0-11)
+     ├──► QuantRegressor ──► score (0-1) → mapped to tier 1-5 threshold
      │
-     └──► RAMDemoter    ──► GPU vs CPU RAM (binary)
+     └──► RAMDemoter ──► GPU vs CPU RAM (binary, with memory_pressure)
 ```
+
+Both models are trained from **heuristic teacher labels** collected during long multi-turn sessions, then exported as float32 weight binaries (~490 floats each).
 
 ---
 
 ## Decision 1: Quant Level (QuantRegressor)
 
 **What:** Which quantization type within the GPU VRAM tier?
-**Type:** Ordinal regression over the 12-level qtable
-**Output:** Continuous score 0-1, mapped to tier 1-5 thresholds
+**Type:** Ordinal regression (continuous score → tier thresholds)
+**Output:** Score 0-1 → mapped to tier 1-5 via `smart_kv_assign_tier`
 
-| Tier | Name | Example Type | Bits |
-|------|------|-------------|------|
-| 1 | Very High | q8_0 / f16 | 8-16 |
-| 2 | Quality | q5_1 / q5_0 | 5 |
-| 3 | Balanced | q4_0 / q4_k | 4 |
-| 4 | Performance | q3_k | 3 |
-| 5 | Ultra | q2_k / iq2_s / iq1_s | 2-1.56 |
-
-**Tier → qtable quality band mapping:**
-
-```
-Tier 1: f16, q8_0             quality 0.995-1.000  (16-8 bit)
-Tier 2: q6_k, q5_k, q5_1, q5_0  quality 0.970-0.990  (6-5 bit)
-Tier 3: q4_k, q4_0            quality 0.945-0.960  (4-4.5 bit)
-Tier 4: q3_k                  quality 0.930        (3.5 bit)
-Tier 5: q2_k, iq2_s, iq1_s    quality 0.780-0.880  (2-1.56 bit)
-```
-
-**Note:** Tier 5 spans a wide range (0.780–0.880). The `iq1_s` cliff at 0.780
-means the MLP must be confident when assigning tier 5 — borderline chunks
-near the tier 4/5 boundary should stay at tier 4 if uncertain.
+| Tier | Name          | TQ Bits | Quality |
+|------|---------------|---------|---------|
+| 1    | Very High     | 0 (F16) | 1.000   |
+| 2    | Quality       | 5       | ~0.994  |
+| 3    | Balanced      | 4-5     | ~0.969  |
+| 4    | Performance   | 2-4     | ~0.959  |
+| 5    | Ultra         | 2       | ~0.941  |
+| 6    | Ultra-TQ (RAM)| —       | N/A     |
 
 **Architecture:**
 ```
-Input(18) → Linear(18→16) → ReLU → Linear(16→1) → Sigmoid → score
-Params: ~321  (~1.3 KB)
+Input(23) → Linear(23→16) → ReLU → Linear(16→1) → Sigmoid → score
+Params: ~401  (~1.6 KB)
 Forward: ~0.5μs
 ```
 
-The score is thresholded using the existing `smart_kv_assign_tier` mechanism.
-Thresholds are adjusted by adaptive gamma under memory pressure.
+The score is thresholded by `smart_kv_assign_tier` using `priority_thresholds` computed from `gamma`:
+```c
+thresholds = {0.80, 0.55, 0.32, 0.18, 0.08} raised to pow(1/gamma)
+```
+With gamma=2.0 (balanced): `{0.894, 0.742, 0.566, 0.424, 0.283}`.
 
 ---
 
 ## Decision 2: RAM Demotion (RAMDemoter)
 
-**What:** Should this chunk leave GPU VRAM entirely?
+**What:** Should this chunk leave GPU VRAM for CPU RAM (tier 6)?
 **Type:** Binary classification
-**Output:** Probability 0-1 (threshold at 0.5, configurable)
+**Output:** Probability 0-1 (threshold at 0.5, configurable via `--ram-threshold`)
 
 **Architecture:**
 ```
-Input(19) → Linear(19→8) → ReLU → Linear(8→1) → Sigmoid → probability
-Params: ~169  (~0.7 KB)
+Input(24) → Linear(24→8) → ReLU → Linear(8→1) → Sigmoid → probability
+Params: ~209  (~0.8 KB)
 Forward: ~0.3μs
 ```
 
-**Additional input features** vs QuantRegressor:
-- `memory_pressure`: current VRAM usage / capacity (0-1)
-  (19th feature; QuantRegressor gets 18 base features without memory_pressure)
-- Higher pressure → more aggressive demotion
+**RAMDemoter gets one extra feature** vs QuantRegressor:
+- `memory_pressure`: current VRAM usage / capacity (0-1) — 24th feature
 
-**Cost weighting:**
-- False positive (evicted but needed): 3× penalty (high latency on decode)
+**Cost weighting during training:**
+- False positive (evicted but needed): **3× penalty** (high latency on CPU→GPU decode)
 - False negative (kept on GPU but unused): 1× penalty (only VRAM waste)
 
-**Label source:**
-- During data collection, log: "was this chunk re-accessed within the next N steps?"
-- If re-accessed → label 0 (keep on GPU)
-- If stale for N steps → label 1 (safe to evict)
-- N = 2048 steps (one scoring interval)
+**Runtime RAMDemoter path** (when both models are loaded):
+1. If `memory_pressure ≤ 0.50` or chunk is pinned → skip RAMDemoter entirely
+2. Run `rd_forward(…)` → if `probability ≥ ram_threshold` (default 0.5) → tier 6
+3. Otherwise fall through to QuantRegressor for tier 1-5 assignment
 
 ---
 
 ## Combined Flow
 
 ```
-For each chunk at scoring interval:
+For each token via kv_cache_store:
 
-  1. Extract features (17-dim: recency, frequency, attn_ema, query,
-     tag_onehot[10], redundancy, chunk_age, pinned, gamma)
+  1. Update chunk metadata: last_used_step, access_count, k/v norm Welford update
 
-  2. RAMDemoter(chunk_features + memory_pressure)
-     if probability > threshold → assign to tier 6 (CPU TQ), skip step 3
+  2. score_slot(slot):
+     a. If learned model loaded: qr_forward() → q_score
+        - If memory_pressure > 0.50 and not pinned: rd_forward() → ram_prob
+          → ram_prob ≥ threshold → tier 6, skip step b
+        - Graduated offload: if q_score ≤ offload_threshold(pressure) → tier 6
+        - smart_kv_assign_tier(q_score, min_tier, thresholds) → tier 1-5
+     b. If heuristic fallback: smart_kv_eval() → tier
 
-  3. QuantRegressor(chunk_features)
-     score → map to tier 1-5
-     enforce min_tier (pinned chunks never demoted below floor)
+  3. Enqueue tier change if target_tier ≠ current_tier
 
-  4. Enqueue migration if target_tier ≠ current_tier
+  4. kv_cache_store: collect training sample (current slot + 2 cold probes)
+     → teacher heuristic labels → push to ring buffer
+
+  5. Every 4096 samples: export rolling dataset to training_data_latest.bin
+```
+
+---
+
+## Heuristic Teacher Labels
+
+Training data labels come from the heuristic scorer, NOT from the learned model (no circularity):
+
+```
+teacher = smart_kv_eval(chunk, step, max_access, &cfg)
+
+quant_label: 1.0 - (teacher_tier - 1) / 5
+  → maps tier 1→1.0 (keep at max quality) through tier 6→0.0 (evict)
+
+ram_label (heuristic):
+  bool low_priority    = teacher.priority <= 0.35f
+  bool cold            = age > kv_size/16 (2048 steps) || access_count <= 1
+  bool stale_rewrite   = total_writes > 1 && access_count <= 1
+  bool pressure_cand   = smart_kv_should_offload(…)
+  ram_label = !pinned && low_priority && (cold || stale_rewrite || pressure_cand)
+```
+
+### Counterfactual Fixup (anti-circularity)
+
+When a chunk is labeled `ram_label=1` (evict) but gets **re-accessed** before the ring buffer rotates out, the label is corrected to 0. This prevents the model from learning to evict chunks that are actually needed:
+
+```
+ls_ring_fixup_labels(ring, slot_id, step, kv_size):
+  for each sample matching chunk_id AND ram_label > 0.5:
+    age = step - sample.last_used_step
+    if age < kv_size / 16:    # re-accessed within the "cold" window
+      sample.ram_label = 0.0  # teacher was wrong
+```
+
+---
+
+## Input Features (23-dim base)
+
+### Core Features (23-dim)
+
+| Index | Feature              | Range   | Description |
+|-------|----------------------|---------|-------------|
+| 0     | recency_log          | 0-1     | log(age+1)/log(kv_size+1) — normalized time since last access |
+| 1     | frequency_log        | 0-1     | log(access_count+1)/log(max_access+1) — normalized access count |
+| 2     | attention_ema        | 0-1     | Running EMA of attention mass from K/V norm signal |
+| 3     | query_score          | 0-1     | Query-key similarity (stale at write time; uses running norm) |
+| 4-13  | tag_onehot[10]       | 0/1     | One-hot encoded chunk tag (system, tool, code, error, …) |
+| 14    | redundancy_score     | 0-1     | Boilerplate/low-info penalty from tag+position |
+| 15    | chunk_age_ratio      | 0-1     | pos_begin / context_length — early chunks age differently |
+| 16    | pinned               | 0/1     | Is chunk explicitly pinned? (system prompts, tool schemas) |
+| 17    | gamma                | 1-4     | Adaptive gamma value (drives tier threshold compression) |
+| 18    | k_norm               | 0-~10   | Running L2 mean norm(K) / sqrt(head_dim) — high = important |
+| 19    | v_norm               | 0-~10   | Running L2 mean norm(V) / sqrt(head_dim) |
+| 20    | k_variance           | 0-~5    | Running variance of K norms across chunk tokens — high = diverse |
+| 21    | promotion_count_log  | 0-1     | log(promotion_count+1)/4 — times promoted back from tier 6 |
+| 22    | recently_promoted    | 0/1     | last_promotion_step within 2048 steps of current step |
+
+### RAMDemoter extra (24th feature)
+
+| Index | Feature          | Range | Description |
+|-------|------------------|-------|-------------|
+| 23    | memory_pressure   | 0-1   | used / capacity — higher = more aggressive eviction |
+
+### Feature Construction (`ls_features_from_meta`)
+
+```c
+ls_features_t ls_features_from_meta(chunk_meta* c, uint64_t step,
+                                     uint32_t kv_size, float gamma) {
+    uint64_t age = step > c->last_used_step ? step - c->last_used_step : 0;
+    feat.recency_log         = logf((float)(age + 1)) / logf((float)(kv_size + 1));
+    feat.frequency_log       = logf((float)(c->access_count + 1)) / logf((float)(cached_max_access + 1));
+    feat.attention_ema       = c->attention_ema;
+    feat.query_score         = c->query_score;
+    tag_onehot(…);
+    feat.redundancy_score    = c->redundancy;
+    feat.chunk_age_ratio     = (float)c->pos_begin / (float)context_length;
+    feat.pinned              = c->pinned ? 1.0f : 0.0f;
+    feat.gamma               = gamma;
+    feat.k_norm              = c->k_norm;
+    feat.v_norm              = c->v_norm;
+    feat.k_variance          = sqrtf(c->k_variance / (float)(c->n_tokens + 1));
+    feat.promotion_count_log = logf((float)(c->promotion_count + 1)) / 4.0f;
+    feat.recently_promoted   = (c->promotion_count > 0 &&
+                                (step - c->last_promotion_step) < 2048) ? 1.0f : 0.0f;
+}
+```
+
+### Legacy 21-dim Compatibility
+
+Datasets exported from older builds (before promotion features were added) have 21 features instead of 23. The trainer auto-pads them with zeros for the two missing promotion features:
+```python
+if n_features == 21:
+    X = np.pad(X, ((0,0), (0,2)))  # pad promotion_count_log, recently_promoted
+```
 
 ---
 
 ## Promotion Path (Tier 6 → GPU)
 
-When a tier-6 (RAM) chunk is retrieved, it must be promoted back to GPU.
+When a tier-6 (RAM) chunk is retrieved, it promotes back to GPU.
 
-**Trigger:** Any `kv_cache_retrieve` call on a tier-6 slot.
-**Action:**
-1. Decode from TQ format back to F16 (the normal retrieve path)
-2. Clear `slot_tier[slot]` to 0 — this marks the chunk as "no longer evicted"
-3. On the next scoring cycle, the chunk's score determines its GPU tier
+**Trigger:** `kv_cache_retrieve` on a tier-6 slot that has TQ-encoded data.
 
-**Why this works:** After retrieval, the F16 tensor still owns the slot's
-position (all tier 6 does is zero the GPU memory). The next write or scoring
-pass sees the chunk as tier 0 and assigns a fresh tier 1-5.
+**Promotion steps:**
+1. Decode TQ → F16 (normal retrieve path)
+2. Increment `promotion_count` (`smart-tq-plugin.cpp:935`)
+3. Set `last_promotion_step = ctx->step` (`smart-tq-plugin.cpp:936`)
+4. Free TQ CPU buffer
+5. The chunk's next scoring pass (after retrieval bumps `last_used_step` and `access_count`) assigns a fresh GPU tier 1-5
 
-**No explicit promotion scoring needed:** The natural recency bump from
-the retrieval (last_used_step updated, access_count incremented) guarantees
-the chunk scores higher on the next cycle.
+**Ping-pong prevention (four mechanisms):**
+1. **Promotion counter → feature**: `promotion_count_log` + `recently_promoted` feed into the learned model. A chunk that ping-pongs gets higher promotion features, making eviction LESS likely.
+2. **Migration backoff**: `smart_kv_should_skip()` blocks re-migration for `min_residency` steps after any tier change.
+3. **Counterfactual fixup**: If a chunk is labeled evict but re-accessed, the label is corrected to 0 in the training ring buffer.
+4. **FP=3× loss weight**: The RAMDemoter is penalized 3× for false evictions, making it conservative by default.
 
-**Potential issue:** If a chunk is repeatedly tier-6 → retrieved → tier-1 →
-stale → tier-6 → retrieved → ..., this "ping-pong" wastes TQ encode/decode
-cycles. Mitigated by migration backoff (skip_counter) and the
-FP-heavy RAMDemoter loss weight.
+---
+
+## Training Data Collection
+
+### Sampling Strategy
+
+Every `kv_cache_store` collects **3 training samples**:
+
+| Sample | Slot | Rate |
+|--------|------|------|
+| Current token | `slot` | Every store (always occupied) |
+| Cold probe 1 | `slot - 256` (forward scan) | Always — probes forward for occupied |
+| Cold probe 2 | `slot - 512` (forward scan) | Always — probes forward for occupied |
+
+The cold probe scans **forward (+1)** from the target offset to find the youngest occupied slot, avoiding empty slots in sparsely-filled caches:
+
+```c
+int64_t cold = (slot + kv_size + offset) % kv_size;
+while ((cold == slot || chunks[cold].access_count == 0) && probes < kv_size/4) {
+    cold = (cold + 1) % kv_size;  // scan toward current slot (warmer)
+    probes++;
+}
 ```
 
----
+This guarantees cold samples even when cache fill is low (~5%), and finds younger (warmer) occupied slots that are less likely to be labeled eviction candidates.
 
-## Combined vs Separate Models
+### Ring Buffer
 
-| Aspect | Single model (old) | Two models (current) |
-|--------|-------------------|---------------------|
-| Params | 609 | ~562 |
-| Forward time | ~1μs | ~1μs |
-| RAM demotion accuracy | implicit via threshold | explicit, tunable |
-| Memory pressure handling | via adaptive gamma only | direct feature input |
-| Training data needs | moderate | moderate (can reuse) |
-| Code complexity | simpler | slightly more |
-| Calibration | one sigmoid for everything | specialized per task |
+- **Capacity:** 131,072 samples (configurable at compile time)
+- **Overwrite:** Circular — oldest samples replaced by newest
+- **Export:** `training_data_latest.bin` written every 4,096 samples (live monitoring)
+- **Session export:** Written on `cache_clear` (server shutdown / checkpoint restore)
+- **RAM pos tracking:** Live `ram_pos=X/Y.Z%` in rolling export log line
 
-**Verdict:** Two models. The RAM demotion decision has a fundamentally different
-cost structure (FP expensive, FN cheap) and depends on global memory pressure,
-not just per-token importance. A specialized binary classifier handles this better
-than a threshold on a general-purpose score.
+### Heuristic Teacher (label generation)
 
----
+```c
+// kv_cache_store → collect_training_sample(slot):
+teacher = smart_kv_eval(chunk, step, max_access, &cfg)
 
-## Input Features (21-dim base)
+quant_label = 1.0 - (teacher_tier - 1) / 5
+// tier 1 → 1.0 (keep at F16), tier 6 → 0.0 (evict)
 
-| Index | Feature | Range | Description |
-|-------|---------|-------|-------------|
-| 0 | recency_log | 0-1 | log(age+1)/16 — normalized time since last access |
-| 1 | frequency_log | 0-1 | log(access_count+1)/6 — normalized access frequency |
-| 2 | attention_ema | 0-1 | Running EMA of attention mass received |
-| 3 | query_score | 0-1 | Query-key similarity to current window (stale at write time) |
-| 4-13 | tag_onehot[10] | 0/1 | One-hot encoded chunk tag |
-| 14 | redundancy_score | 0-1 | Boilerplate/low-info penalty |
-| 15 | chunk_age_ratio | 0-1 | pos_begin / context_length |
-| 16 | pinned | 0/1 | Is chunk explicitly pinned? |
-| 17 | gamma | 1-4 | Adaptive gamma value |
-| 18 | k_norm | 0-~10 | Running mean L2 norm(K) / sqrt(head_dim) — high = likely important |
-| 19 | v_norm | 0-~10 | Running mean L2 norm(V) / sqrt(head_dim) |
-| 20 | k_variance | 0-~5 | Running variance of K norms across chunk tokens — high = diverse content |
+ram_label = 0.0
+if (!pinned && teacher.priority <= 0.35f && (cold || stale_rewrite || pressure_candidate))
+    ram_label = 1.0
+```
 
-**RAMDemoter only (22nd feature):**
-| 21 | memory_pressure | 0-1 | used / capacity |
+Where:
+- `cold = age > kv_size/16 || access_count <= 1`
+- `stale_rewrite = total_writes > 1 && access_count <= 1`
+- `pressure_candidate = smart_kv_should_offload(memory_used, memory_capacity, priority)`
 
-**Note:** `k_norm` alone is often more predictive than `redundancy_score` or `tag_onehot`
-for distinguishing important from boilerplate content. Large K norms correlate with
-tokens that produce large attention logits — the model's own implicit importance signal.
+### Threshold Selection History
 
-**Budget note:** Tag one-hot consumes 10/21 features (~48%). In practice, some tags
-(file_path, command) may be rare. Run `tag_usage_counts = Counter(features[:, 4:14].sum(0))`
-after data collection — any tag with <1% usage can be dropped to free feature slots.
+The teacher threshold was tuned iteratively:
+- 0.35 → too tight, ~0% positives
+- 0.50 → still too tight
+- 0.55 → some positives but inconsistent
+- 0.60 → better but still low
+- 0.566 → matches tier 4 boundary (original `tier >= 4` condition), ~44% at high fill
+- 0.35 (current) → combined with warmer cold probes (-256/-512 forward scan) to target 5-20%
 
 ---
 
 ## Training Pipeline
 
-### Data Collection
-
-Done by the plugin during inference (`collect_training_data.py` drives scenarios):
-
-```python
-# For each chunk at scoring time:
-features = extract_features(chunk_meta)
-
-# Quant label: what tier did the chunk "deserve"?
-# Proxy: did the model attend to this chunk later?
-if re_attended_within_N_steps:
-    quant_label = map(attention_mass → tier)
-else:
-    quant_label = 0.0  # low tier
-
-# RAM label: was it accessed again?
-ram_label = 0 if re_accessed else 1
-
-ls_ring_push(quant_ring, features, quant_label)
-ls_ring_push(ram_ring, features + [memory_pressure], ram_label)
+### Script
+```bash
+python train_learned_score.py plugins/smart-kv-plugin/training_data_latest.bin plugins/smart-kv-plugin
 ```
 
-### Training
+### Dataset Format (binary)
 
 ```
-python train_learned_score.py training_data.bin
+[header] 8 bytes:  n_samples (float), n_features (float)
+[X]       n * n_features * 4 bytes:  feature matrix (float32)
+[y_quant] n * 4 bytes:  quant labels (float32, 0-1)
+[y_ram]   n * 4 bytes:  ram labels (float32, 0 or 1)
+[mp]      n * 4 bytes:  memory_pressure at collection time (float32, 0-1)
 ```
 
-The training script learns both models from the same dataset:
+### QuantRegressor Training
 
-1. **QuantRegressor**: MSE loss on normalized tier (1-5 → 0.2-1.0)
-2. **RAMDemoter**: Weighted BCE loss (FP=3×, FN=1×)
+- **Loss:** MSE on normalized tier (1-5 → 0.2-1.0; tier 6 → 0.0)
+- **Architecture:** `Input(23) → Linear(23→16) → ReLU → Linear(16→1) → Sigmoid`
+- **Output:** quant_weight.bin (23×16 + 16 + 16×1 + 1 = 401 floats)
 
-Architecture in training:
+### RAMDemoter Training
 
-```python
-class QuantRegressor(nn.Module):
-    def __init__(self):
-        self.net = nn.Sequential(
-            nn.Linear(18, 16), nn.ReLU(),
-            nn.Linear(16, 1), nn.Sigmoid(),
-        )
+- **Loss:** Weighted BCE (FP=3×, FN=1×)
+- **Architecture:** `Input(24) → Linear(24→8) → ReLU → Linear(8→1) → Sigmoid`
+- **Output:** ram_weight.bin (24×8 + 8 + 8×1 + 1 = 209 floats)
 
-class RAMDemoter(nn.Module):
-    def __init__(self):
-        self.net = nn.Sequential(
-            nn.Linear(19, 8), nn.ReLU(),
-            nn.Linear(8, 1), nn.Sigmoid(),
-        )
+### Feature Importance Report
+
+After training, the script prints per-feature L2 weight norms for both models, highlighting promotion features:
+
+```
+Feature importance (QuantRegressor):
+  recency_log         0.842  <<
+  frequency_log       0.531
+  attention_ema       0.298
+  ...
+  promotion_count_log 0.143  <<<< PROMOTION
+  recently_promoted   0.097  <<<< PROMOTION
 ```
 
-### Export
-
-Each model exports to its own binary:
-```
-quant_weights.bin  (18×16 + 16 + 16×1 + 1 = 321 floats)
-ram_weights.bin    (19×8 + 8 + 8×1 + 1 = 169 floats)
-```
+Features with `<<` markers are the promotion-tracking features, verifying they contribute non-zero weight.
 
 ---
 
-## Benchmark Methodology
+## Memory Pressure Integration
 
-Compare perplexity and VRAM across cache policies:
+Memory pressure controls **three** independent offload paths:
 
-| Policy | Cache Config | VRAM | PPL |
-|--------|------------|------|-----|
-| F16 (oracle) | `--cache-type-k f16` | high | baseline |
-| Q8 uniform | `--cache-type-k q8_0` | medium | +0.X% |
-| Q4 uniform | `--cache-type-k q4_0` | low | +X% |
-| Mixed bucket | `--cache-type-k-mixed q5_0:2048,q4_0:8192,q2_k:0` | low | +X% |
-| Smart heuristic | heuristic scorer | low | +X% |
-| Smart learned | learned QuantRegressor | low | +X% |
-| Smart + TQ | learned + RAMDemoter | lowest | +X% |
+### 1. Learned RAMDemoter (at memory_pressure > 0.50)
+```c
+if (lscorer.ram_loaded && pressure > 0.50f) {
+    float ram_prob = rd_forward(&feat, pressure);
+    if (ram_prob >= g_ram_threshold) return TIER_6;
+}
+```
 
-**Measurement:**
-1. Start server with profile
-2. Send multi-turn conversations (coding scenarios)
-3. Collect logprobs from API responses
-4. Compute per-token perplexity
-5. Measure VRAM from server logs
+### 2. Graduated Offload Threshold (heuristic fallback)
+```c
+if (pressure > 0.92f) threshold = 0.20f;   // desperate — evict anything cold
+else if (pressure > 0.85f) threshold = 0.12f;
+else if (pressure > 0.75f) threshold = 0.10f;
+else if (pressure > 0.65f) threshold = 0.08f;
+else if (pressure > 0.50f) threshold = 0.05f;
+// priority ≤ threshold → tier 6
+```
 
-**Tool:** `benchmark_quality.py --trials 3`
+### 3. Adaptive Gamma (tier threshold compression)
+```c
+float gamma = smart_kv_adaptive_gamma(base_gamma, memory_used, memory_capacity);
+// Higher gamma → thresholds compress → more chunks fall into lower tiers
+```
+
+### Pressure Variance in Training Data
+
+Memory pressure is captured per-sample in the dataset as the `mem_pressure` field. During training, the RAMDemoter receives it as a direct feature, allowing it to learn pressure-dependent eviction behavior. The collector's long-run test profile naturally produces a range of pressure values (mean ~0.166-0.219 observed), so a separate high-pressure collection phase is unnecessary.
 
 ---
 
-## Key Design Principles
+## Ping-Pong and Cycling Behavior
 
-1. **RAM demotion is conservative**: False positives (evicting needed data)
-   are 3× more expensive than false negatives (keeping unused data on GPU).
-   The RAMDemoter should be calibrated with high precision at the cost of recall.
+### ram_pos Cycling
 
-3. **RAM label lookahead is proportional**: `lookahead = min(2048, context_len / 4)`.
-   Short prompts need more lookahead relative to context; long contexts need less
-   because a chunk that wasn't re-accessed in 2048 steps of a 200k context is truly stale.
+The fraction of positive RAM labels in the ring buffer (`ram_pos`) cycles through each test round:
 
-4. **Gamma in QuantRegressor only**: The adaptive gamma feature goes into
-   QuantRegressor (where it influences tier thresholds) but is excluded from
-   RAMDemoter — RAMDemoter already has `memory_pressure` as a direct feature,
-   making gamma redundant for eviction decisions.
+1. **Start of round** (fresh cache): Cold chunks available → high ram_pos (25-30%)
+2. **Mid-round** (cache warming): Cold probe misses empty slots → ram_pos drops
+3. **Late round** (cache full, ~22% fill): Stable equilibrium at 44-66%
+4. **cache_clear between rounds**: Ring buffer resets → cycle repeats
 
-2. **Quant regression is continuous**: Tier boundaries are soft. Under memory
-   pressure (high gamma), scores compress and chunks naturally fall into lower tiers.
-   No hard boundaries except min_tier (for pinned content).
+**Root cause:** Low cache fill (~5%) causes offset-based cold probes (-512, -2048) to hit empty slots ~94% of the time. The fix uses **forward-scan probing** to always find an occupied slot, and **warmer offsets** (-256/-512) to avoid over-labeling.
 
-3. **Training data is perishable**: Session data collected today may not match
-   tomorrow's usage patterns. Cross-session weight averaging prevents overfit
-   to any single session.
+### Promotion Tracking for Ping-Pong Mitigation
 
-4. **Fallback always works**: If the plugin fails or weights are missing, the
-   heuristic scorer (recency + frequency + pin) provides a reasonable default.
+```c
+// On tier-6 retrieve:
+c->promotion_count++;
+c->last_promotion_step = ctx->step;
+```
+
+These feed into two features:
+- `promotion_count_log`: log-scale count of evict→promote cycles
+- `recently_promoted`: binary flag if promoted within last 2048 steps
+
+The model learns: **high promotion_count → don't evict this chunk again**.
+
+---
+
+## Combined vs Separate Models
+
+| Aspect | Heuristic only (fallback) | Learned (two models) |
+|--------|--------------------------|---------------------|
+| Params | 0 (formula-based) | ~610 |
+| Forward time | ~1μs | ~1μs |
+| RAM demotion | implicit via tier threshold | explicit, tunable |
+| Memory pressure | via adaptive gamma only | direct feature + graduated thresholds |
+| Training data | none | needs collection run |
+| Robustness | always works | falls back to heuristic if weights missing |
 
 ---
 
@@ -299,185 +402,72 @@ Compare perplexity and VRAM across cache policies:
 
 ```
 smart-kv-plugin/
-├── smart-kv-cache.h        # Core API: chunk meta, weights, inline scorers
-├── smart-kv-cache.c        # Quality table, tier mapping, tag defaults
-├── learned-score.h         # MLP models (QuantRegressor + RAMDemoter)
-├── smart-tq-plugin.cpp     # Combined plugin: scoring + TQ + data collection
-├── train_learned_score.py  # PyTorch training (both models)
-├── collect_training_data.py # Multi-trial data collector
-├── benchmark_quality.py    # Quality benchmark across cache configs
-├── test-smart-kv-cache.c   # Unit tests (11 scenarios)
-├── test-tq-integration.cpp # TQ pipeline integration test
-├── ARCHITECTURE.md         # This file
-├── PATCHES.md              # llama.cpp mixed-cache patches
-├── README.md               # Quick start
-└── SMART_KV_PLAN.md        # Original design doc (legacy)
+├── smart-kv-cache.h          # Core API: chunk meta, weights, inline scorers
+├── smart-kv-cache.c          # Quality table, tier mapping, tag defaults, profiles
+├── learned-score.h           # MLP models (QuantRegressor + RAMDemoter), ring buffer
+├── smart-tq-plugin.cpp       # Combined plugin: scoring + TQ + data collection + export
+├── train_learned_score.py    # PyTorch training (from root dir)
+├── collect_training_data.py  # Multi-scenario data collector
+├── benchmark_quality.py      # Quality benchmark across cache configs
+├── test-smart-kv-cache.c     # Unit tests
+├── test-tq-integration.cpp   # TQ pipeline integration test
+├── build_plugin.bat          # ROCm clang++ build script
+├── ARCHITECTURE.md           # This file
+├── PATCHES.md                # llama.cpp mixed-cache patches
+├── BUILD.md                  # Build instructions
+├── README.md                 # Quick start
+└── build/
+    └── smart-tq-plugin.dll   # Built plugin binary
 ```
+
+---
+
+## Build & Deploy
+
+```bash
+build_plugin.bat              # ROCm clang++ → build/smart-tq-plugin.dll
+# Copy build/smart-tq-plugin.dll → smart-tq-plugin.dll (after server stop)
+```
+
+The plugin DLL is loaded at server startup via `llama-server --plugin smart-tq-plugin.dll`. If the DLL is missing or incompatible, the server logs a warning and continues without it.
 
 ---
 
 ## Implementation Status
 
-- [x] Heuristic scorer (recency, frequency, pin, redundancy)
+- [x] Heuristic scorer (recency, frequency, pin, redundancy, attention, K/V norms)
 - [x] Tier mapping (1-6, SMART_KV_TIER_COUNT=6)
 - [x] Prefill analysis (tag + min_tier from raw text)
 - [x] Adaptive gamma (tightens under memory pressure)
 - [x] Migration backoff (skip_counter, min_residency)
 - [x] Tag weight modifiers (per-tag pin/recency/redundancy multipliers)
-- [x] Learned MLP scorer (single model, 17→32→1, legacy)
-- [x] Training data collection + export
-- [x] PyTorch training pipeline
-- [x] Two-model architecture (QuantRegressor 21→16→1 + RAMDemoter 22→8→1)
+- [x] Learned quant scorer (QuantRegressor: 23→16→1)
+- [x] Learned RAM demoter (RAMDemoter: 24→8→1)
+- [x] Training data collection + ring buffer + rolling export
+- [x] Heuristic teacher labels with counterfactual fixup
 - [x] K/V norm features (k_norm, v_norm, k_variance)
-- [x] Promotion path (tier 6 → GPU on re-access)
-- [x] Counterfactual RAM labels (fixup_labels, breaks circularity)
-- [x] Deferred re-access tracking in ring buffer export
-- [ ] Medium model (26-dim, 32 hidden, ~1.1K params)
-- [ ] Large model (36-dim, 64 hidden, ~4.4K params)
-- [ ] XL model (52-dim, 128 hidden, ~20K params, confidence head)
-- [ ] Random K/V projections for XL content awareness
-- [ ] RAMDemoter with memory_pressure feature
-- [ ] Weighted BCE loss (FP=3×) for RAM demotion
-- [ ] Cross-session weight averaging
+- [x] Promotion tracking features (promotion_count_log, recently_promoted)
+- [x] Promotion path (tier 6 → GPU on re-access, counter incremented)
+- [x] Weighted BCE loss (FP=3×) for RAM demotion
+- [x] Feature importance report (per-feature L2 weight norms)
+- [x] Legacy 21-dim backward compat (auto-pad with zeros)
+- [x] Forward-scan cold probe (guarantees occupied slot, warmer offsets)
+- [x] Graduated offload threshold (pressure-dependent)
 - [ ] Online adaptive training (SGD during inference)
 - [ ] Attention-feedback labels (real attention weights)
-- [ ] Per-layer MLP (separate weights per decoder layer)
-- [ ] Per-head tiering (different tiers per GQA head)
+- [ ] Per-layer scoring (separate weights per decoder layer)
+- [ ] Cross-session weight averaging
 
 ---
 
-## Feature Tier Roadmap (Nano → Medium → Large → XL)
+## Design Principles
 
-Nano is the current implementation (21-dim, 321 params). Larger tiers share the
-Nano trunk and add features progressively — Nano weights are the reusable base.
+1. **Only heuristic teacher labels**: Never label from the learned model itself — avoids circularity. Counterfactual fixup corrects over-eager heuristics.
 
-### Medium — 26 dim (+8 over Nano)
+2. **RAM demotion is conservative**: False positives (evicting needed chunks) cost 3× more than false negatives (wasting VRAM). The loss weight and graduated threshold both push toward precision over recall.
 
-Adds K/V full stats, session awareness, and attention entropy:
+3. **Crash only if broken**: If weights file is missing or mismatched dimension (e.g., old 21-dim weights with new 23-dim model), the plugin falls back to heuristic scoring. Server continues normally.
 
-| Index | Feature | Range | Description |
-|-------|---------|-------|-------------|
-| 18 | k_norm | 0-1 | l2_norm(K) normalized by running max |
-| 19 | v_norm | 0-1 | l2_norm(V) normalized by running max |
-| 20 | k_variance | 0-1 | variance across chunk's K vectors |
-| 21 | v_variance | 0-1 | variance across chunk's V vectors |
-| 22 | layer_depth | 0-1 | layer_idx / num_layers |
-| 23 | head_idx_norm | 0-1 | head_idx / num_heads |
-| 24 | session_token_ratio | 0-1 | tokens_seen / max_context |
-| 25 | attn_entropy | 0-1 | entropy of chunk's received attention distribution |
+4. **Offsets age by design**: The -256/-512 cold offsets with forward scan find warmer-but-not-current slots. After ~256 tokens, the recency penalty drops priority enough to test the boundary.
 
-`attn_entropy` is key: low entropy = many queries need the chunk a little
-(diffuse), high entropy = few queries need it a lot (spiked). Different
-demotion profiles for each.
-
-**Hidden:** 32. **Params:** ~1.1K. **Latency:** ~0.8μs.
-
-### Large — 36 dim (+10 over Medium)
-
-Cross-chunk context and per-head breakdown:
-
-| Index | Feature | Range | Description |
-|-------|---------|-------|-------------|
-| 26 | k_cosine_to_query_mean | -1 to 1 | cosine sim of chunk K to running mean of recent queries |
-| 27 | v_cosine_to_recent | -1 to 1 | cosine sim of chunk V to recently recalled V vectors |
-| 28 | neighbour_attn_mean | 0-1 | mean attention of ±2 surrounding chunks |
-| 29 | neighbour_tier_mean | 0-1 | mean assigned tier of surrounding chunks |
-| 30 | head_importance_variance | 0-1 | variance of attn_ema across heads for this chunk |
-| 31 | miss_rate_ema | 0-1 | EMA of demotion false positive rate this session |
-| 32 | promotion_count | 0-1 | log(times promoted back from tier 6) / 4 |
-| 33 | cross_layer_attn_std | 0-1 | std dev of attention received across layers |
-| 34 | quant_error_ema | 0-1 | running EMA of observed dequant error for this tier |
-| 35 | pinned_neighbour | 0/1 | any pinned chunk within ±4 positions |
-
-`neighbour_tier_mean` and `neighbour_attn_mean` exploit attention locality —
-adjacent chunks likely share fate. `miss_rate_ema` closes the calibration
-loop: if RAMDemoter has been wrong this session, it learns to be conservative.
-
-**Hidden:** 64. **Params:** ~4.4K. **Latency:** ~1.2μs.
-
-### XL — 52 dim (+16 over Large)
-
-Random projections of K/V subspace for genuine content awareness:
-
-| Index | Feature | Range | Description |
-|-------|---------|-------|-------------|
-| 36-43 | k_proj[8] | -1 to 1 | K @ fixed_random_matrix (8×d_head projection) |
-| 44-51 | v_proj[8] | -1 to 1 | V @ fixed_random_matrix (8×d_head projection) |
-
-The random projection matrices are **fixed at init, never trained** — the
-Johnson-Lindenstrauss lemma guarantees they preserve inner product geometry.
-This gives XL content awareness without learned projection overhead:
-
-```c
-// generate once at startup, store in model weights file
-void init_random_projections(float* k_proj_mat, float* v_proj_mat,
-                              int d_head, int proj_dim, uint64_t seed) {
-    srand(seed);
-    for (int i = 0; i < d_head * proj_dim; i++) {
-        k_proj_mat[i] = gaussian_random() / sqrtf(proj_dim);
-        v_proj_mat[i] = gaussian_random() / sqrtf(proj_dim);
-    }
-}
-
-// at encode time — cheap matmul after mean-pooling K across chunk
-void extract_kv_proj(float* out, float* K_mean,
-                     float* proj_mat, int d_head, int proj_dim) {
-    memset(out, 0, proj_dim * sizeof(float));
-    for (int i = 0; i < d_head; i++)
-        for (int j = 0; j < proj_dim; j++)
-            out[j] += K_mean[i] * proj_mat[i * proj_dim + j];
-}
-```
-
-XL also gets a **third output head** on the same trunk for confidence:
-
-```
-Input(52) → Linear(52→128) → ReLU → Linear(128→64) → ReLU
-                                                          │
-                        ┌─────────────────────────────────┤
-                        ↓                 ↓               ↓
-              Linear(64→1)       Linear(64→1)    Linear(64→1)
-              quant quality      p_demote        confidence
-```
-
-The confidence head gates decisions at inference:
-
-```c
-if (confidence < 0.6f) {
-    // XL is uncertain — fall back to Medium's decision
-    quality_score = lerp(medium_score, xl_score, confidence / 0.6f);
-}
-```
-
-**Hidden:** 128. **Params:** ~20K. **Latency:** ~2.5μs.
-
-### Architecture Summary
-
-| Tier | Input | Hidden | Params | Latency | When to use |
-|------|-------|--------|--------|---------|-------------|
-| Nano | 21 | 16 | ~321 | ~0.5μs | Always (current default) |
-| Medium | 26 | 32 | ~1.1K | ~0.8μs | >200 samples in ring buffer |
-| Large | 36 | 64 | ~4.4K | ~1.2μs | >2000 samples + memory pressure |
-| XL | 52 | 128 | ~20K | ~2.5μs | >10000 samples, research only |
-
-### Feature Availability Tiers
-
-Not all features are free — they tier by when computation is possible:
-
-```
-Free at write time (always compute, include in all tiers):
-  k_norm, v_norm, k_variance, k_proj, v_proj,
-  layer_depth, head_idx_norm, session_token_ratio
-
-Cheap at scoring interval (compute per chunk, Medium+):
-  attn_entropy, neighbour_attn_mean, neighbour_tier_mean,
-  head_importance_variance, cross_layer_attn_std
-
-Requires history (accumulate over session, Large+):
-  miss_rate_ema, quant_error_ema, promotion_count,
-  k_cosine_to_query_mean, v_cosine_to_recent
-```
-
-**Cold start note:** Large/XL features that require history should warm to
-0.5 (neutral), not 0, to avoid biasing the model during the first ~100 tokens
-before signal accumulates.
+5. **Promotion tracking breaks ping-pong**: Each evict→promote cycle increments a counter that feeds back as model features. Chunks that have been ping-ponged become harder to evict.

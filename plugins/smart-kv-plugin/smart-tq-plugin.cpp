@@ -80,9 +80,12 @@ struct SmartTQContext {
     int32_t head_dim_v;
     int     bits_per_angle;
 
+    // FP8 mode: when the GPU tensor is F8_E4M3, each slot uses 1 B/el instead of 2
+    bool      fp8_active;      // true if tensor is F8_E4M3 (halved VRAM per slot)
+
     // TQ storage per slot, allocated dynamically when a slot enters tier 6.
-    // Indirection: for each slot, store whether it's tier 6 (TQ only) or tier 1-5 (F16)
-    uint8_t*  slot_tier;       // [kv_size] — 0 = F16 (tiers 1-5), 6 = Ultra-TQ
+    // Indirection: for each slot, store whether it's tier 6 (TQ only) or tier 1-5 (F16/FP8)
+    uint8_t*  slot_tier;       // [kv_size] — 0 = GPU (F16 or FP8), 6 = Ultra-TQ
     uint8_t** k_rows;          // [kv_size] allocated only for tier-6 slots
     uint8_t** v_rows;          // [kv_size] allocated only for tier-6 slots
     size_t    tq_bytes;        // bytes per head vector in TQ format
@@ -104,7 +107,7 @@ struct SmartTQContext {
     uint64_t n_tier6_stored;
     uint64_t n_tier6_retrieved;
 
-    SmartTQContext() : n_train_samples(0), n_total_tier_decisions(0), n_tq_row_allocs(0), n_tq_row_frees(0), n_tier6_stored(0), n_tier6_retrieved(0), cached_max_access(0), train_ring(NULL) {
+    SmartTQContext() : fp8_active(false), n_train_samples(0), n_total_tier_decisions(0), n_tq_row_allocs(0), n_tq_row_frees(0), n_tier6_stored(0), n_tier6_retrieved(0), cached_max_access(0), train_ring(NULL) {
         memset(n_tier_decisions, 0, sizeof(n_tier_decisions));
     }
 };
@@ -114,6 +117,7 @@ struct SmartTQContext {
 static bool g_loaded = false;
 static bool g_train_mode = false;
 static bool g_snapshot_exports = false;
+static bool g_fp8_mode = false;
 static const char* g_profile_name = "balanced";
 static float g_offload_scale = 1.0f;
 static uint64_t g_stats_interval = 8192;
@@ -175,7 +179,9 @@ static void on_load(void) {
     const char* snapshot_exports = getenv("SMART_KV_SNAPSHOT_EXPORTS");
     const char* export_dir = getenv("SMART_KV_EXPORT_DIR");
     const char* profile = getenv("SMART_KV_PROFILE");
+    const char* fp8_env = getenv("SMART_KV_FP8");
     const char* stats_interval = getenv("SMART_KV_STATS_INTERVAL");
+    g_fp8_mode = fp8_env && fp8_env[0] && strcmp(fp8_env, "0") != 0;
     g_train_mode = train_mode && train_mode[0] && strcmp(train_mode, "0") != 0;
     g_snapshot_exports = snapshot_exports && snapshot_exports[0] && strcmp(snapshot_exports, "0") != 0;
     if (stats_interval && stats_interval[0]) {
@@ -209,6 +215,7 @@ static void on_load(void) {
     fprintf(stderr, "[smart-tq] plugin dir: %s\n", g_plugin_dir);
     fprintf(stderr, "[smart-tq] export dir: %s\n", g_export_dir);
     fprintf(stderr, "[smart-tq] profile: %s (offload scale %.2f, ram threshold %.2f)\n", g_profile_name, g_offload_scale, g_ram_threshold);
+    fprintf(stderr, "[smart-tq] FP8 mode: %s (set SMART_KV_FP8=1 to enable)\n", g_fp8_mode ? "enabled" : "disabled");
     fprintf(stderr, "[smart-tq] live stats interval: %llu decisions\n", (unsigned long long)g_stats_interval);
     if (g_train_mode) {
         fprintf(stderr, "[smart-tq] training mode: heuristic teacher labels, learned weights disabled\n");
@@ -235,9 +242,10 @@ static void dump_stats(SmartTQContext* ctx, const char* reason) {
         }
     }
 
-    fprintf(stderr, "[smart-tq] stats dump (%s): profile=%s decisions=%llu occupied=%llu/%lld tier6_slots=%llu tq_cpu=%.2f MiB allocs=%llu frees=%llu stored=%llu retrieved=%llu\n",
+    fprintf(stderr, "[smart-tq] stats dump (%s): profile=%s fp8=%d decisions=%llu occupied=%llu/%lld tier6_slots=%llu tq_cpu=%.2f MiB allocs=%llu frees=%llu stored=%llu retrieved=%llu\n",
             reason ? reason : "manual",
             g_profile_name,
+            ctx->fp8_active ? 1 : 0,
             (unsigned long long)decisions,
             (unsigned long long)occupied,
             (long long)ctx->kv_size,
@@ -263,6 +271,7 @@ static void dump_stats(SmartTQContext* ctx, const char* reason) {
     if (f) {
         fprintf(f, "{\n");
         fprintf(f, "  \"profile\": \"%s\",\n", g_profile_name);
+        fprintf(f, "  \"fp8_mode\": %d,\n", ctx->fp8_active ? 1 : 0);
         fprintf(f, "  \"reason\": \"%s\",\n", reason ? reason : "manual");
         fprintf(f, "  \"decisions\": %llu,\n", (unsigned long long)decisions);
         fprintf(f, "  \"occupied_slots\": %llu,\n", (unsigned long long)occupied);
@@ -496,14 +505,25 @@ static void* kv_cache_create_layer(const ggml_plugin_kv_cache_params_t* params,
         ctx->chunks[i].min_tier = 0;
     }
 
+    // Detect FP8 tensor support: user must set SMART_KV_FP8=1 AND use
+    // --cache-type-k f8_e4m3 --cache-type-v f8_e4m3 (requires ggml core patches).
+    // The plugin detects the tensor type at init by checking params->type_k/type_v
+    // or by env var opt-in. When FP8 is active, each GPU slot uses 1 B/el vs 2 B/el.
+    ctx->fp8_active = g_fp8_mode;
+    if (ctx->fp8_active) {
+        fprintf(stderr, "[smart-tq] SMART_KV_FP8=1 — FP8 GPU tensor active (1 B/el, 2× VRAM efficiency)\n");
+    }
+
     // Detect VRAM budget and set memory_capacity dynamically
     {
         uint64_t vram_budget = detect_vram_budget();
         if (vram_budget > 0) {
-            // Compute bytes per slot: layers × 2 (K+V) × heads × head_dim × 2 (F16)
+            // Bytes per slot: heads × max(head_dim) × 2 (K+V)
+            // F16 = 2 bytes/el, FP8 = 1 byte/el
+            uint64_t bytes_per_el = ctx->fp8_active ? 1 : 2;
             uint64_t bytes_per_slot = (uint64_t)ctx->n_head_kv
                 * (uint64_t)(ctx->head_dim_k > ctx->head_dim_v ? ctx->head_dim_k : ctx->head_dim_v)
-                * 2 * 2;  // F16 = 2 bytes, K+V = 2 copies
+                * bytes_per_el * 2;  // K+V = 2 copies
             if (bytes_per_slot > 0) {
                 uint64_t max_slots = vram_budget / bytes_per_slot;
                 if (max_slots < ctx->kv_size) {
@@ -519,6 +539,11 @@ static void* kv_cache_create_layer(const ggml_plugin_kv_cache_params_t* params,
         }
         if (ctx->cfg.memory_capacity == 0) {
             ctx->cfg.memory_capacity = ctx->kv_size;  // default: full cache
+        }
+        // When FP8 is active, each GPU slot uses 1 B/el instead of 2 B/el,
+        // so the same VRAM fits 2× more slots. Double effective capacity.
+        if (ctx->fp8_active) {
+            ctx->cfg.memory_capacity = (uint32_t)(ctx->cfg.memory_capacity * 2);
         }
     }
 
@@ -637,10 +662,19 @@ static uint8_t score_slot(SmartTQContext* ctx, int64_t slot) {
             smart_kv_init_weights(&adj, gamma);
         }
 
+        // Pressure scaling: smoothly lower quant tiers as VRAM fills
+        // (operates independently of RAMDemoter which handles full CPU offload)
+        float pressure = ctx->cfg.memory_capacity > 0
+            ? (float)ctx->cfg.memory_used / (float)ctx->cfg.memory_capacity : 0.0f;
+        if (pressure > 0.10f) {
+            float factor = 1.0f - (pressure - 0.10f) * 0.5f;
+            if (factor < 0.60f) factor = 0.60f;
+            q_score *= factor;
+        }
+
         // Dynamic RAM offload: if VRAM is nearly full and this chunk is cold,
         // evict to CPU via tier 6 instead of keeping on GPU at a lower quant.
         if (ctx->cfg.memory_capacity > 0 && !c->pinned) {
-            float pressure = (float)ctx->cfg.memory_used / (float)ctx->cfg.memory_capacity;
             if (ctx->lscorer.ram_loaded && pressure > 0.50f) {
                 float ram_prob = rd_forward(&ctx->lscorer.ram, &feat, pressure);
                 if (ram_prob >= g_ram_threshold) {
@@ -690,7 +724,7 @@ static uint64_t collect_training_sample(SmartTQContext* ctx, int64_t slot, uint3
     if (teacher_tier >= SMART_KV_TIER_ULTRA_TQ) quant_label = 0.0f;
 
     uint64_t age = ctx->step > c->last_used_step ? ctx->step - c->last_used_step : 0;
-    bool low_priority = teacher.priority <= 0.55f || teacher_tier >= SMART_KV_TIER_PERFORMANCE;
+    bool low_priority = teacher.priority <= 0.28f;
     bool cold = age > (uint64_t)(ctx->kv_size / 16) || c->access_count <= 1;
     bool stale_rewrite = ctx->total_writes[slot] > 1 && c->access_count <= 1;
     bool pressure_candidate = smart_kv_should_offload(ctx->cfg.memory_used, ctx->cfg.memory_capacity, teacher.priority);
@@ -787,16 +821,22 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
             }
         }
 
-        // Collect training data: sample current token + older slots
+        // Collect training data: sample current slot always, cold slots near write cursor
         if (g_train_mode || g_snapshot_exports) {
             uint32_t max_access = ctx->cached_max_access;
 
             uint64_t samples_seen = collect_training_sample(ctx, slot, max_access);
-            if (ctx->kv_size > 0) {
-                int64_t older1 = (slot + ctx->kv_size - 512 + ctx->kv_size) % ctx->kv_size;
-                int64_t older2 = (slot + ctx->kv_size - 2048 + ctx->kv_size) % ctx->kv_size;
-                if (older1 != slot) samples_seen = collect_training_sample(ctx, older1, max_access);
-                if (older2 != slot && older2 != older1) samples_seen = collect_training_sample(ctx, older2, max_access);
+            int64_t kv_sz = (int64_t)ctx->kv_size;
+            const int cold_offsets[] = { -256 };
+            for (int c = 0; c < 1; c++) {
+                int64_t cold = (slot + kv_sz + cold_offsets[c]) % kv_sz;
+                int probes = 0;
+                while ((cold == slot || ctx->chunks[cold].access_count == 0) && probes < (int)(kv_sz / 4)) {
+                    cold = (cold + 1) % kv_sz;
+                    probes++;
+                }
+                if (cold != slot && ctx->chunks[cold].access_count > 0)
+                    samples_seen = collect_training_sample(ctx, cold, max_access);
             }
 
             // Optional debug snapshots. Disabled by default so training uses
@@ -824,8 +864,14 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
                 char dpath[512];
                 make_export_path(dpath, sizeof(dpath), "training_data_latest.bin");
                 int n = ctx->train_ring ? ls_export_dataset(dpath, ctx->train_ring) : 0;
-                fprintf(stderr, "[smart-tq] updated rolling dataset: %d samples (%llu seen) to %s\n",
-                        n, (unsigned long long)samples_seen, dpath);
+                uint32_t ram_pos = 0;
+                if (ctx->train_ring) {
+                    for (uint32_t k = 0; k < ctx->train_ring->count; k++)
+                        if (ctx->train_ring->samples[k].ram_label > 0.5f) ram_pos++;
+                }
+                float pct = ctx->train_ring && ctx->train_ring->count > 0 ? (100.0f * ram_pos / ctx->train_ring->count) : 0.0f;
+                fprintf(stderr, "[smart-tq] updated rolling dataset: %d samples (%llu seen) ram_pos=%u/%.1f%% to %s\n",
+                        n, (unsigned long long)samples_seen, ram_pos, pct, dpath);
             }
         }
 
@@ -920,6 +966,8 @@ static int kv_cache_retrieve(void* layer_ctx, int64_t pos,
             // ── Tier 6: decode from TQ CPU, mark for promotion ──
             // Clear slot_tier so the next scoring cycle promotes this chunk
             // back to an appropriate GPU tier.
+            c->promotion_count++;
+            c->last_promotion_step = ctx->step;
             ctx->slot_tier[slot] = 0;
             c->tier = 0;
             c->target_tier = 0;
@@ -1033,4 +1081,16 @@ static ggml_plugin_descriptor_t g_desc = {
 extern "C" GGML_PLUGIN_EXPORT
 ggml_plugin_descriptor_t* ggml_plugin_get_descriptor(void) {
     return &g_desc;
+}
+
+// ── Tier routing export ──────────────────────────────────────────────
+// Called by llama-model.cpp via ggml_plugin_get_export() to wire
+// tier_fn_ so that tier-6 slots route to the TQ plugin bucket
+// (kv_size=1 GPU cell) instead of the full F16 tensor.
+
+extern "C" GGML_PLUGIN_EXPORT
+uint8_t smart_tq_get_tier(uint32_t global_pos) {
+    if (!g_shared_ctx) return 0;
+    if ((int64_t)global_pos >= g_shared_ctx->kv_size) return 0;
+    return g_shared_ctx->slot_tier[global_pos];
 }

@@ -61,6 +61,10 @@ typedef struct {
     uint32_t access_count;
     float    attention_ema;
 
+    // Promotion tracking — prevents tier-6 ping-pong
+    uint32_t promotion_count;      // times promoted back from tier-6
+    uint64_t last_promotion_step;  // step of most recent tier-6 promotion
+
     // K/V tensor statistics — cheapest predictive features
     float k_norm;          // running mean L2 norm(K) / sqrt(head_dim)
     float v_norm;          // running mean L2 norm(V) / sqrt(head_dim)

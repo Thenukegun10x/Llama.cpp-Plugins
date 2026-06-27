@@ -1,0 +1,22 @@
+{
+  "profile": "ultra",
+  "fp8_mode": 1,
+  "reason": "live",
+  "decisions": 8192,
+  "occupied_slots": 139,
+  "kv_size": 32768,
+  "tier6_slots": 0,
+  "tq_cpu_bytes_live": 0,
+  "tq_row_allocs": 0,
+  "tq_row_frees": 0,
+  "tier6_stored": 0,
+  "tier6_retrieved": 0,
+  "tiers": [
+    {"tier": 1, "name": "Very High", "decisions": 0, "percent": 0.000000},
+    {"tier": 2, "name": "Quality", "decisions": 0, "percent": 0.000000},
+    {"tier": 3, "name": "Balanced", "decisions": 8192, "percent": 100.000000},
+    {"tier": 4, "name": "Performance", "decisions": 0, "percent": 0.000000},
+    {"tier": 5, "name": "Ultra", "decisions": 0, "percent": 0.000000},
+    {"tier": 6, "name": "Ultra-TQ (CPU)", "decisions": 0, "percent": 0.000000}
+  ]
+}

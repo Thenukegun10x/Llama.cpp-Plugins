@@ -442,6 +442,85 @@ Added `ti < 0` bounds check in both the known-type and fallback paths.
 When adding new quant types to `qtable[]`, review the `steps[]` offsets
 to ensure they don't produce negative indices (documented in qtable comments).
 
+## Tier Routing Patch (Tier 6 → VRAM savings)
+
+These changes wire the plugin's tier decisions into llama.cpp's mixed-cache
+routing so that tier-6 slots go to the TQ plugin bucket (1 GPU cell, `~0.5 MB`)
+instead of the full F16 tensor (`~400 MB`).
+
+### 16. Plugin: `smart_tq_get_tier` export (`smart-tq-plugin.cpp`)
+
+```cpp
+extern "C" GGML_PLUGIN_EXPORT
+uint8_t smart_tq_get_tier(uint32_t global_pos) {
+    if (!g_shared_ctx) return 0;
+    if ((int64_t)global_pos >= g_shared_ctx->kv_size) return 0;
+    return g_shared_ctx->slot_tier[global_pos];
+}
+```
+
+### 17. Plugin loader: `ggml_plugin_get_export()` (`ggml-plugin.h`, `ggml-plugin.c`)
+
+Generic symbol lookup across all loaded plugins:
+
+```c
+// ggml-plugin.h:
+GGML_PLUGIN_API void* ggml_plugin_get_export(const char* symbol_name);
+
+// ggml-plugin.c:
+void* ggml_plugin_get_export(const char* symbol_name) {
+    for (int i = 0; i < g_n_plugins; i++) {
+        void* sym = dl_sym(g_plugins[i]->handle, symbol_name);
+        if (sym) return sym;
+    }
+    return NULL;
+}
+```
+
+### 18. `llama-model.cpp`: wire tier_fn_
+
+Added after mixed cache creation in `create_memory()`:
+
+```cpp
+auto* mixed = static_cast<llama_kv_cache_mixed*>(res);
+typedef uint8_t (*tier_fn_t)(uint32_t);
+auto fn = (tier_fn_t)ggml_plugin_get_export("smart_tq_get_tier");
+if (fn) mixed->set_tier_fn(fn);
+```
+
+### 19. `llama-kv-cache-mixed.cpp`: tier-6 routing (not unified)
+
+Changed routing from `t >= 1` (all tiers → TQ) to `t >= 6` (only CPU offload):
+
+```cpp
+// route_write:
+if (t >= 6) {  // was: t >= 1
+
+// route_write_remaining:
+if (tier_fn_ && tier_fn_(global_pos) >= 6) return UINT32_MAX;  // was: >= 1
+```
+
+### 20. `add_tq_plugin_bucket`: 1 cell placeholder
+
+Changed from `kv_size` cells to `1` cell — saves `~400 MB` GPU VRAM:
+
+```cpp
+auto kv = std::make_unique<llama_kv_cache>(
+    ... 1, n_seq_max, n_pad, ...);  // was: kv_size
+bi.capacity = 1;  // was: kv_size
+```
+
+### VRAM savings (tier-6 offload)
+
+| Component | Before | After |
+|-----------|--------|-------|
+| GPU F16 tensor (all slots) | kv_size × n_embd × F16 (~400 MB) | kv_size × n_embd × F16 (~400 MB) |
+| TQ plugin bucket GPU tensor | absent | 1 cell × n_embd × F16 (~12 KB) |
+| Tier-6 CPU TQ storage | 0 | variable (dynamic per-slot) |
+
+Tier-6 slots now **skip the GPU F16 allocation** entirely — they only exist
+in CPU TQ format. The 1-cell GPU bucket is a routing placeholder.
+
 ## Applying the Patches
 
 ```
