@@ -20,12 +20,12 @@ Launches the server with FP8 KV cache + smart tiered eviction plugin. See `start
 
 **DLL:** `plugins\smart-kv-plugin\smart-tq-plugin.dll`
 
-A 6-tier scoring-based KV cache with self-learning MLP scorers:
+A 6-tier scoring-based KV cache with self-learning MLP scorers. Lower tiers use less VRAM per token — FP8 cuts VRAM in half, TurboQuant offloads to CPU entirely:
 
 | Tier | Storage | Location | Cost |
 |------|---------|----------|------|
 | 1-2 Very High / Quality | F16 (2 B/el) or FP8 (1 B/el) | GPU VRAM | Highest quality |
-| 3-4 Balanced / Performance | FP8 (1 B/el) | GPU VRAM | 2x density vs F16 |
+| 3-4 Balanced / Performance | FP8 (1 B/el) | GPU VRAM | 2x slots vs F16 (half the VRAM) |
 | 5 Ultra | FP8 (1 B/el) | GPU VRAM | More aggressive retention |
 | 6 Ultra-TQ | TurboQuant (~0.43 B/el) | **CPU RAM** | VRAM-free |
 
@@ -58,11 +58,11 @@ Two MLP models trained from heuristic teacher labels:
 
 **DLL:** `plugins\fp8-kv-plugin\build\fp8-kv-plugin.dll`
 
-Extends the smart-kv tier system with native `GGML_TYPE_F8_E4M3` GPU tensors. Requires AMD RDNA4 (RX 9070 XT) or CDNA3 GPU + ROCm 6.2+.
+Extends the smart-kv tier system with native `GGML_TYPE_F8_E4M3` GPU tensors. FP8 uses 1 byte per element vs F16's 2 bytes — **you fit twice the KV cache in the same VRAM**. Requires AMD RDNA4 (RX 9070 XT) or CDNA3 GPU + ROCm 6.2+.
 
 When FP8 is enabled, tiers become:
 - **Tier 1-2:** F16 (2 B/el, hot/lossless)
-- **Tier 3-4:** FP8 (1 B/el, ~10% relative error, 2x VRAM)
+- **Tier 3-4:** FP8 (1 B/el, ~10% relative error, **half the VRAM of F16**)
 - **Tier 5-6:** TurboQuant (CPU offload)
 
 Requires ggml core patches for `GGML_TYPE_F8_E4M3` type, HIP F16↔F8 conversion kernels, and F8 flash attention path. Applied to the llama.cpp source in this repo.
@@ -149,7 +149,7 @@ llama-server
 | F16 + Smart-KV | — | 69.4 t/s | ~33 t/s |
 | F8 + Smart-KV | — | 61.9 t/s | ~33 t/s |
 
-FP8 saves 50% KV cache VRAM with ~10% generation overhead. Smart-KV plugin adds ~11% overhead for tier scoring. At long context, attention O(n²) dominates.
+FP8 uses half the KV cache VRAM of F16 (~10% generation overhead). Smart-KV plugin adds ~11% overhead for tier scoring. At long context, attention O(n²) dominates.
 
 ---
 
