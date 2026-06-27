@@ -145,6 +145,20 @@ kernels process F16 data with their well-tested dequantizers. No perf regression
 — same memory bandwidth for conversion, just moved upstream of the attention
 kernel.
 
+### VEC Kernel Restored for F8 (2026-06-27)
+
+After the initial workaround (skipping VEC for F8), the VEC kernel was
+restored by routing F8 types through the F16 VEC template. In
+`ggml_cuda_flash_attn_ext_vec`, when `K->type == GGML_TYPE_F8_E4M3`, the
+function dispatches to `ggml_cuda_flash_attn_ext_vec_case<D, GGML_TYPE_F16, GGML_TYPE_F16>`.
+The F16 template sets `need_f16_K/V = true`, which triggers `convert_unary`
+F8→F16 before the kernel. The F16 VEC kernel then reads F16 data with
+`vec_dot_fattn_vec_KQ_f16` and `dequantize_V_f16`.
+
+This restores the fastest VEC kernel speed while keeping F8 memory savings.
+The `can_use_vector_kernel` exclusion for F8 was removed — VEC is fully
+available for F8 KV cache.
+
 ### Smart-TQ `memory_used` Fix (2026-06-27)
 
 `free_tq_slot()` was called unconditionally for every non-TQ6 store, including
