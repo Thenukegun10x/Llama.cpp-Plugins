@@ -18,18 +18,17 @@ Launches the server with FP8 KV cache + smart tiered eviction plugin. See `start
 
 ## Plugins
 
-### `smart-kv-plugin` (stratum-cache) — *loaded by default*
+### `smart-kv-plugin` (stratum-cache) — *enabled by Smart-KV presets*
 
-**DLL:** `plugins\smart-kv-plugin\smart-tq-plugin.dll`
+**DLL:** `plugins\smart-kv-plugin\build\smart-tq-plugin.dll`
 
-A 6-tier scoring-based KV cache with self-learning MLP scorers. Lower tiers use less VRAM per token — FP8 cuts VRAM in half, TurboQuant offloads to CPU entirely:
+A 6-tier scoring-based KV cache with self-learning MLP scorers. Tiers 1-5 stay in the selected GPU KV tensor (`f16` for F16 presets, `f8_e4m3` for FP8 presets). Tier 6 offloads cold slots to CPU RAM with TurboQuant:
 
-| Tier | Storage | Location | Cost |
-|------|---------|----------|------|
-| 1-2 Very High / Quality | F16 (2 B/el) or FP8 (1 B/el) | GPU VRAM | Highest quality |
-| 3-4 Balanced / Performance | FP8 (1 B/el) | GPU VRAM | 2x slots vs F16 (half the VRAM) |
-| 5 Ultra | FP8 (1 B/el) | GPU VRAM | More aggressive retention |
-| 6 Ultra-TQ | TurboQuant (~0.43 B/el) | **CPU RAM** | VRAM-free |
+| Tier | Decision | Storage | Location |
+|------|----------|---------|----------|
+| 1-2 Very High / Quality | Hottest/highest-value slots | Selected GPU KV type (`f16` or `f8_e4m3`) | GPU VRAM |
+| 3-5 Balanced / Performance / Ultra | Lower-priority slots kept on GPU | Selected GPU KV type (`f16` or `f8_e4m3`) | GPU VRAM |
+| 6 Ultra-TQ | Cold/offloaded slots | TurboQuant (~0.43 B/el) | CPU RAM |
 
 Two MLP models trained from heuristic teacher labels:
 - **QuantRegressor** (23→16→1, 401 params): assigns GPU tier 1-5
@@ -57,14 +56,14 @@ Two MLP models trained from heuristic teacher labels:
 
 ### Context Compression (`SMART_KV_COMPRESS=1`)
 
-When the KV cache fills past a tunable threshold, the plugin drops the
-coldest contiguous block of slots to free up space — **without losing recent
-context or attention sinks**. The model continues to see the full `n_ctx`,
-but dropped slots contain zeros (which softmax ignores).
+When the KV cache fills past a tunable threshold, the plugin frees the
+coldest contiguous block of slots so they can be reused, while preserving
+recent context and the first slots used as attention sinks. The configured
+`n_ctx` does not change.
 
 **Benefits:**
 - Prevents OOM at long context by freeing cold slots before pressure hits 100%
-- No quality loss: only slots with low attention_ema + low access count + old last_used_step are dropped
+- Designed to minimize quality impact: only slots with low attention_ema + low access count + old last_used_step are dropped
 - Transparent to harnesses — they still see `n_ctx` unchanged
 - Works alongside all other features (FP8, TQ, tiers)
 
@@ -94,18 +93,20 @@ set SMART_KV_COMPRESS_THRESHOLD=0.50
 
 ---
 
-### `fp8-kv-plugin` — *FP8 GPU tensor tier (opt-in)*
+### `fp8-kv-plugin` — *experimental standalone FP8 KV plugin*
 
 **DLL:** `plugins\fp8-kv-plugin\build\fp8-kv-plugin.dll`
 
-Extends the smart-kv tier system with native `GGML_TYPE_F8_E4M3` GPU tensors. FP8 uses 1 byte per element vs F16's 2 bytes — **you fit twice the KV cache in the same VRAM**. Requires AMD RDNA4 (RX 9070 XT) or CDNA3 GPU + ROCm 6.2+.
+Prototype standalone plugin for native `GGML_TYPE_F8_E4M3` GPU tensors. It is not loaded by `start.bat` or `plugins.env`; the active FP8 presets use llama.cpp `--cache-type-k f8_e4m3 --cache-type-v f8_e4m3` with `smart-tq-plugin`.
 
-When FP8 is enabled, tiers become:
+FP8 uses 1 byte per element vs F16's 2 bytes, so the KV tensor uses half the VRAM. Native FP8 requires ggml core patches, ROCm support, and AMD RDNA4 (RX 9070 XT) or CDNA3-class hardware.
+
+Intended standalone tier plan:
 - **Tier 1-2:** F16 (2 B/el, hot/lossless)
 - **Tier 3-4:** FP8 (1 B/el, ~10% relative error, **half the VRAM of F16**)
 - **Tier 5-6:** TurboQuant (CPU offload)
 
-Requires ggml core patches for `GGML_TYPE_F8_E4M3` type, HIP F16↔F8 conversion kernels, and F8 flash attention path. Applied to the llama.cpp source in this repo.
+Requires ggml core patches for `GGML_TYPE_F8_E4M3` type, HIP F16↔F8 conversion kernels, and an F8 flash attention path.
 
 **Env var:** `FP8_KV_ENABLE=1` (opt-in)
 
@@ -137,13 +138,12 @@ Not loaded directly — the compression code is compiled into the tiered cache p
 
 ```
 llama-server
- ├── built-in FLASH_ATTN (ggml-cuda)
+ ├── built-in flash attention (-fa on)
  ├── --plugin-attn on → sage-attention-plugin (HIP flash attention)
- └── --plugin-kv-cache on → smart-kv-plugin (via plugins.env)
-       ├── tiers 1-5: GPU F16/FP8
-       │     └── fp8-kv-plugin opt-in: FP8 tiers (GGML_TYPE_F8_E4M3)
+ └── --plugin-kv-cache on → smart-tq-plugin (via plugins.env)
+       ├── tiers 1-5: selected GPU KV tensor (F16 or F8_E4M3)
        └── tier 6: CPU TurboQuant (PolarQuant+QJL)
-             └── turbo-quant-plugin compression engine
+             └── turbo-quant code compiled into smart-tq-plugin
 ```
 
 ### Startup order
@@ -151,15 +151,15 @@ llama-server
 1. `start.bat` sets `HIP_VISIBLE_DEVICES=1`, `LLAMA_PLUGIN_FILE=plugins.env`
 2. llama-server loads DLLs listed in `plugins.env`
 3. Each plugin's `on_load()` fires → registers capabilities
-4. `plugins.env` currently loads: `smart-tq-plugin.dll`
+4. `plugins.env` currently loads: `plugins\smart-kv-plugin\build\smart-tq-plugin.dll`
 
 ### Plugin loading
 
 - `plugins.env` — specifies DLL paths and load order
 - `LLAMA_PLUGIN_FILE` — alternative env var for the plugin list
-- Plugins advertise capabilities via `GGML_PLUGIN_CAP_*`:
-  - `GGML_PLUGIN_CAP_KV_CACHE` — intercepts KV cache store/retrieve
-  - `GGML_PLUGIN_CAP_ATTN` — replaces flash attention compute
+- Plugins advertise capabilities via `GGML_PLUGIN_CAP_*`
+- `GGML_PLUGIN_CAP_KV_CACHE` intercepts KV cache store/retrieve
+- `GGML_PLUGIN_CAP_ATTN` replaces flash attention compute
 
 ---
 
@@ -216,14 +216,14 @@ FP8 uses **half the KV cache VRAM** of F16 (~10% generation overhead). Smart-KV 
 
 Requires ROCm 7.1, CMake + Ninja, and Visual Studio 2022.
 
-```
-git clone --recurse-submodules https://github.com/Thenukegun10x/Llama.cpp-Plugins
-cd llama.cpp
-cmake -G Ninja .. -DGGML_HIP=ON -DGGML_HIP_ROCWMMA_FATTN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAMDGPU_TARGETS=gfx1201
-cmake --build . --target llama-server -j 8
+```bat
+git clone --recurse-submodules https://github.com/Thenukegun10x/Llama.cpp-Plugins.git
+cd Llama.cpp-Plugins
+cmake -S llama.cpp -B llama.cpp\build -G Ninja -DGGML_HIP=ON -DGGML_HIP_ROCWMMA_FATTN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAMDGPU_TARGETS=gfx1201
+cmake --build llama.cpp\build --target llama-server -j 8
 ```
 
-Each plugin also has its own build script in its directory.
+Each plugin also has its own build script in its directory. `start.bat` expects `llama.cpp\build\bin\llama-server.exe`; update `plugins.env` if the checked-in absolute DLL path does not match your clone location.
 
 ---
 
