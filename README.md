@@ -87,7 +87,7 @@ Built from: [SageAttention-rocm](https://github.com/Thenukegun10x/SageAttention-
 
 **DLL:** `plugins\turbo-quant-plugin\build\Release\turbo-quant-plugin.dll`
 
-PolarQuant (recursive polar-coordinate transform) + QJL (sign-bit residual correction) compression. Compresses F16 K/V vectors to ~5.44 bpw. Used as a library by `smart-kv-plugin` and `fp8-kv-plugin` for tier-6 CPU offload.
+PolarQuant (recursive polar-coordinate transform) + QJL (sign-bit residual correction) compression, inspired by Google's TurboQuant approach. Compresses F16 K/V vectors to ~5.44 bpw. Used as a library by `smart-kv-plugin` and `fp8-kv-plugin` for tier-6 CPU offload.
 
 Not loaded directly — the compression code is compiled into the tiered cache plugins.
 
