@@ -66,6 +66,8 @@ static inline float f16_to_f32(uint16_t h) {
 // ── Per-layer context ────────────────────────────────────────────────
 
 struct SmartTQContext {
+    bool               owns_policy;
+
     // Learned scorers (QuantRegressor + RAMDemoter)
     learned_scorer_t    lscorer;
     ls_ring_buffer_t*   train_ring;
@@ -79,6 +81,7 @@ struct SmartTQContext {
     int32_t head_dim_k;
     int32_t head_dim_v;
     int     bits_per_angle;
+    int     layer_idx;
 
     // FP8 mode: when the GPU tensor is F8_E4M3, each slot uses 1 B/el instead of 2
     bool      fp8_active;      // true if tensor is F8_E4M3 (halved VRAM per slot)
@@ -94,6 +97,7 @@ struct SmartTQContext {
     smart_kv_config   cfg;
     smart_kv_chunk_meta* chunks;  // [kv_size] — one per slot
     uint64_t          step;
+    int64_t           last_store_pos;  // de-duplicates per-layer K/V callbacks for one logical slot write
     uint32_t*         total_writes;  // [kv_size] — persistent across cache clear
 
     // Cached values to avoid re-scanning
@@ -109,7 +113,7 @@ struct SmartTQContext {
     uint64_t n_compress_events;
     uint64_t n_compress_slots;
 
-    SmartTQContext() : fp8_active(false), n_train_samples(0), n_total_tier_decisions(0), n_tq_row_allocs(0), n_tq_row_frees(0), n_tier6_stored(0), n_tier6_retrieved(0), n_compress_events(0), n_compress_slots(0), cached_max_access(0), train_ring(NULL) {
+    SmartTQContext() : owns_policy(false), fp8_active(false), layer_idx(-1), n_train_samples(0), n_total_tier_decisions(0), n_tq_row_allocs(0), n_tq_row_frees(0), n_tier6_stored(0), n_tier6_retrieved(0), n_compress_events(0), n_compress_slots(0), step(0), last_store_pos(-1), cached_max_access(0), train_ring(NULL) {
         memset(n_tier_decisions, 0, sizeof(n_tier_decisions));
     }
 };
@@ -121,9 +125,10 @@ static bool g_train_mode = false;
 static bool g_snapshot_exports = false;
 static bool g_fp8_mode = false;
 static bool g_compress_mode = false;
+static bool g_tq_encode_mode = false;
 static const char* g_profile_name = "balanced";
 static float g_offload_scale = 1.0f;
-static uint64_t g_stats_interval = 8192;
+static uint64_t g_stats_interval = 0;          // live stats disabled by default; clear/unload still dump
 static float g_ram_threshold = 0.80f;
 static float g_compress_pressure = 0.80f;    // start compressing at 80% fill
 static int   g_compress_block = 4;           // drop 4 slots at a time
@@ -136,6 +141,7 @@ static void free_all_tq_slots(SmartTQContext* ctx);
 
 // Singleton KV cache context — shared across all layers
 static SmartTQContext* g_shared_ctx = NULL;
+static std::vector<SmartTQContext*> g_layer_ctxs;
 static char g_plugin_dir[512] = ".";
 static char g_export_dir[512] = ".";
 
@@ -188,6 +194,7 @@ static void on_load(void) {
     const char* export_dir = getenv("SMART_KV_EXPORT_DIR");
     const char* profile = getenv("SMART_KV_PROFILE");
     const char* fp8_env = getenv("SMART_KV_FP8");
+    const char* tq_encode_env = getenv("SMART_KV_TQ_ENCODE");
     const char* stats_interval = getenv("SMART_KV_STATS_INTERVAL");
     const char* compress_env = getenv("SMART_KV_COMPRESS");
     const char* compress_pressure_env = getenv("SMART_KV_COMPRESS_PRESSURE");
@@ -196,6 +203,7 @@ static void on_load(void) {
     const char* compress_interval_env = getenv("SMART_KV_COMPRESS_INTERVAL");
     const char* compress_threshold_env = getenv("SMART_KV_COMPRESS_THRESHOLD");
     g_fp8_mode = fp8_env && fp8_env[0] && strcmp(fp8_env, "0") != 0;
+    g_tq_encode_mode = tq_encode_env && tq_encode_env[0] && strcmp(tq_encode_env, "0") != 0;
     g_compress_mode = compress_env && compress_env[0] && strcmp(compress_env, "0") != 0;
     if (compress_pressure_env && compress_pressure_env[0]) {
         float v = (float)atof(compress_pressure_env);
@@ -251,7 +259,12 @@ static void on_load(void) {
     fprintf(stderr, "[smart-tq] export dir: %s\n", g_export_dir);
     fprintf(stderr, "[smart-tq] profile: %s (offload scale %.2f, ram threshold %.2f)\n", g_profile_name, g_offload_scale, g_ram_threshold);
     fprintf(stderr, "[smart-tq] FP8 mode: %s (set SMART_KV_FP8=1 to enable)\n", g_fp8_mode ? "enabled" : "disabled");
-    fprintf(stderr, "[smart-tq] live stats interval: %llu decisions\n", (unsigned long long)g_stats_interval);
+    fprintf(stderr, "[smart-tq] TQ encode: %s (set SMART_KV_TQ_ENCODE=1 to enable experimental CPU TQ writes)\n", g_tq_encode_mode ? "enabled" : "disabled");
+    if (g_stats_interval > 0) {
+        fprintf(stderr, "[smart-tq] live stats interval: %llu decisions\n", (unsigned long long)g_stats_interval);
+    } else {
+        fprintf(stderr, "[smart-tq] live stats: disabled (set SMART_KV_STATS_INTERVAL to enable)\n");
+    }
     if (g_train_mode) {
         fprintf(stderr, "[smart-tq] training mode: heuristic teacher labels, learned weights disabled\n");
     }
@@ -278,9 +291,20 @@ static void dump_stats(SmartTQContext* ctx, const char* reason) {
     for (int64_t i = 0; i < ctx->kv_size; i++) {
         if (ctx->slot_tier[i] == SMART_KV_TIER_ULTRA_TQ) {
             tier6_slots++;
-            if (ctx->k_rows[i]) tq_bytes_live += (uint64_t)ctx->n_head_kv * ctx->tq_bytes;
-            if (ctx->v_rows[i]) tq_bytes_live += (uint64_t)ctx->n_head_kv * ctx->tq_bytes;
+            for (SmartTQContext* layer : g_layer_ctxs) {
+                if (!layer || i >= layer->kv_size) continue;
+                if (layer->k_rows[i]) tq_bytes_live += (uint64_t)layer->n_head_kv * layer->tq_bytes;
+                if (layer->v_rows[i]) tq_bytes_live += (uint64_t)layer->n_head_kv * layer->tq_bytes;
+            }
         }
+    }
+
+    uint64_t row_allocs = 0;
+    uint64_t row_frees = 0;
+    for (SmartTQContext* layer : g_layer_ctxs) {
+        if (!layer) continue;
+        row_allocs += layer->n_tq_row_allocs;
+        row_frees  += layer->n_tq_row_frees;
     }
 
     fprintf(stderr, "[smart-tq] stats dump (%s): profile=%s fp8=%d decisions=%llu occupied=%llu/%lld tier6_slots=%llu tq_cpu=%.2f MiB allocs=%llu frees=%llu stored=%llu retrieved=%llu\n",
@@ -292,8 +316,8 @@ static void dump_stats(SmartTQContext* ctx, const char* reason) {
             (long long)ctx->kv_size,
             (unsigned long long)tier6_slots,
             (double)tq_bytes_live / (1024.0 * 1024.0),
-            (unsigned long long)ctx->n_tq_row_allocs,
-            (unsigned long long)ctx->n_tq_row_frees,
+            (unsigned long long)row_allocs,
+            (unsigned long long)row_frees,
             (unsigned long long)ctx->n_tier6_stored,
             (unsigned long long)ctx->n_tier6_retrieved);
 
@@ -319,8 +343,8 @@ static void dump_stats(SmartTQContext* ctx, const char* reason) {
         fprintf(f, "  \"kv_size\": %lld,\n", (long long)ctx->kv_size);
         fprintf(f, "  \"tier6_slots\": %llu,\n", (unsigned long long)tier6_slots);
         fprintf(f, "  \"tq_cpu_bytes_live\": %llu,\n", (unsigned long long)tq_bytes_live);
-        fprintf(f, "  \"tq_row_allocs\": %llu,\n", (unsigned long long)ctx->n_tq_row_allocs);
-        fprintf(f, "  \"tq_row_frees\": %llu,\n", (unsigned long long)ctx->n_tq_row_frees);
+        fprintf(f, "  \"tq_row_allocs\": %llu,\n", (unsigned long long)row_allocs);
+        fprintf(f, "  \"tq_row_frees\": %llu,\n", (unsigned long long)row_frees);
         fprintf(f, "  \"tier6_stored\": %llu,\n", (unsigned long long)ctx->n_tier6_stored);
         fprintf(f, "  \"tier6_retrieved\": %llu,\n", (unsigned long long)ctx->n_tier6_retrieved);
         fprintf(f, "  \"tiers\": [\n");
@@ -364,14 +388,20 @@ static void on_unload(void) {
     g_loaded = false;
     if (g_shared_ctx) {
         dump_stats(g_shared_ctx, "unload");
-        free_all_tq_slots(g_shared_ctx);
-        free(g_shared_ctx->k_rows);
-        free(g_shared_ctx->v_rows);
+        for (SmartTQContext* ctx : g_layer_ctxs) {
+            if (!ctx) continue;
+            free_all_tq_slots(ctx);
+            free(ctx->k_rows);
+            free(ctx->v_rows);
+        }
         free(g_shared_ctx->slot_tier);
         free(g_shared_ctx->chunks);
         free(g_shared_ctx->total_writes);
         free(g_shared_ctx->train_ring);
-        delete g_shared_ctx;
+        for (SmartTQContext* ctx : g_layer_ctxs) {
+            delete ctx;
+        }
+        g_layer_ctxs.clear();
         g_shared_ctx = NULL;
     }
     fprintf(stderr, "[smart-tq] unloaded\n");
@@ -438,49 +468,48 @@ static uint64_t detect_vram_budget(void) {
 
 static void* kv_cache_create_layer(const ggml_plugin_kv_cache_params_t* params,
                                     int bits_per_angle) {
-    // Tier assignment is global per-position, not per-layer.
-    // Return the same singleton for all layers to avoid duplicating
-    // the ~10.9 MB TQ buffers per layer (32 layers × 2 K/V = 64 copies).
-    // On second call (warmup), don't re-init — ring buffer data persists.
+    // Tier assignment is global per-position, but TQ payloads are per layer.
+    // The first created context owns policy metadata; every layer gets its own
+    // row tables so an offloaded slot can round-trip all layer K/V rows.
     if (g_shared_ctx) {
-        // Mixed cache has buckets with different kv_sizes.
-        // If this bucket is larger, grow allocations.
-        if ((uint64_t)params->kv_size > g_shared_ctx->kv_size) {
-            uint64_t old_kv = g_shared_ctx->kv_size;
-            size_t new_sz = (size_t)params->kv_size;
-            void* tmp;
+        SmartTQContext* ctx = new (std::nothrow) SmartTQContext();
+        if (!ctx) return NULL;
 
-            tmp = realloc(g_shared_ctx->k_rows, new_sz * sizeof(uint8_t*));
-            if (tmp) g_shared_ctx->k_rows = (uint8_t**)tmp;
-            tmp = realloc(g_shared_ctx->v_rows, new_sz * sizeof(uint8_t*));
-            if (tmp) g_shared_ctx->v_rows = (uint8_t**)tmp;
-            tmp = realloc(g_shared_ctx->chunks, new_sz * sizeof(smart_kv_chunk_meta));
-            if (tmp) g_shared_ctx->chunks = (smart_kv_chunk_meta*)tmp;
-            tmp = realloc(g_shared_ctx->total_writes, new_sz * sizeof(uint32_t));
-            if (tmp) g_shared_ctx->total_writes = (uint32_t*)tmp;
-            tmp = realloc(g_shared_ctx->slot_tier, new_sz);
-            if (tmp) g_shared_ctx->slot_tier = (uint8_t*)tmp;
-
-            g_shared_ctx->kv_size = new_sz;
-
-            // Zero new entries
-            memset(g_shared_ctx->k_rows + old_kv, 0,
-                   ((size_t)params->kv_size - old_kv) * sizeof(uint8_t*));
-            memset(g_shared_ctx->v_rows + old_kv, 0,
-                   ((size_t)params->kv_size - old_kv) * sizeof(uint8_t*));
-            memset(g_shared_ctx->chunks + old_kv, 0,
-                   ((size_t)params->kv_size - old_kv) * sizeof(smart_kv_chunk_meta));
-            memset(g_shared_ctx->total_writes + old_kv, 0,
-                   ((size_t)params->kv_size - old_kv) * sizeof(uint32_t));
-            memset(g_shared_ctx->slot_tier + old_kv, 0,
-                   (size_t)params->kv_size - old_kv);
+        ctx->n_embd_k_gqa  = params->n_embd_k_gqa;
+        ctx->n_embd_v_gqa  = params->n_embd_v_gqa;
+        ctx->kv_size       = params->kv_size;
+        ctx->n_head_kv     = params->n_head_kv;
+        ctx->head_dim_k    = params->head_dim_k;
+        ctx->head_dim_v    = params->head_dim_v;
+        ctx->bits_per_angle = bits_per_angle;
+        ctx->layer_idx     = params->layer_idx;
+        int hd = (params->head_dim_k > params->head_dim_v)
+                 ? params->head_dim_k : params->head_dim_v;
+        ctx->tq_bytes      = turboquant_size(hd, bits_per_angle);
+        ctx->fp8_active    = g_shared_ctx->fp8_active;
+        ctx->cfg           = g_shared_ctx->cfg;
+        ctx->slot_tier     = g_shared_ctx->slot_tier;
+        ctx->chunks        = g_shared_ctx->chunks;
+        ctx->total_writes  = g_shared_ctx->total_writes;
+        ctx->k_rows = (uint8_t**)calloc((size_t)ctx->kv_size, sizeof(uint8_t*));
+        ctx->v_rows = (uint8_t**)calloc((size_t)ctx->kv_size, sizeof(uint8_t*));
+        if (!ctx->k_rows || !ctx->v_rows) {
+            free(ctx->k_rows);
+            free(ctx->v_rows);
+            delete ctx;
+            return NULL;
         }
-        return g_shared_ctx;
+
+        g_layer_ctxs.push_back(ctx);
+        fprintf(stderr, "[smart-tq] layer %d: %ld slots x %d heads, TQ block=%zuB, per-layer row tables=%zuB\n",
+                params->layer_idx, (long)ctx->kv_size, ctx->n_head_kv,
+                ctx->tq_bytes, (size_t)ctx->kv_size * sizeof(uint8_t*) * 2);
+        return ctx;
     }
 
     SmartTQContext* ctx = new (std::nothrow) SmartTQContext();
     if (!ctx) return NULL;
-    g_shared_ctx = ctx;
+    ctx->owns_policy = true;
 
     ctx->n_embd_k_gqa  = params->n_embd_k_gqa;
     ctx->n_embd_v_gqa  = params->n_embd_v_gqa;
@@ -489,6 +518,7 @@ static void* kv_cache_create_layer(const ggml_plugin_kv_cache_params_t* params,
     ctx->head_dim_k    = params->head_dim_k;
     ctx->head_dim_v    = params->head_dim_v;
     ctx->bits_per_angle = bits_per_angle;
+    ctx->layer_idx      = params->layer_idx;
 
     // TQ block size = larger of K/V head dim
     int hd = (params->head_dim_k > params->head_dim_v)
@@ -509,9 +539,13 @@ static void* kv_cache_create_layer(const ggml_plugin_kv_cache_params_t* params,
     if (!ctx->k_rows || !ctx->v_rows || !ctx->slot_tier || !ctx->chunks || !ctx->total_writes) {
         free(ctx->k_rows); free(ctx->v_rows);
         free(ctx->slot_tier); free(ctx->chunks);
+        free(ctx->total_writes);
         delete ctx;
         return NULL;
     }
+
+    g_shared_ctx = ctx;
+    g_layer_ctxs.push_back(ctx);
 
     // Initialize smart cache config
     ctx->cfg.weights = SMART_KV_WEIGHTS_NO_ATTN;
@@ -685,11 +719,7 @@ static void decode_head_fp16(const uint8_t* src, int head_dim,
 static uint8_t score_slot(SmartTQContext* ctx, int64_t slot) {
     if (slot < 0 || slot >= ctx->kv_size) return 0;
     smart_kv_chunk_meta* c = &ctx->chunks[slot];
-    uint32_t max_access = 1;
-    for (int64_t i = 0; i < ctx->kv_size; i++)
-        if (ctx->chunks[i].access_count > max_access)
-            max_access = ctx->chunks[i].access_count;
-    ctx->cached_max_access = max_access;
+    uint32_t max_access = ctx->cached_max_access > 0 ? ctx->cached_max_access : 1;
 
     // memory_used tracked incrementally in kv_cache_store and cache_clear
 
@@ -868,7 +898,8 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
                            const void* k_data, const void* v_data,
                            int64_t n_tokens) {
     SmartTQContext* ctx = (SmartTQContext*)layer_ctx;
-    if (!ctx) return -1;
+    SmartTQContext* policy = g_shared_ctx ? g_shared_ctx : ctx;
+    if (!ctx || !policy) return -1;
 
     const uint16_t* k_fp16 = k_data ? (const uint16_t*)k_data : nullptr;
     const uint16_t* v_fp16 = v_data ? (const uint16_t*)v_data : nullptr;
@@ -877,140 +908,147 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
 
     for (int64_t t = 0; t < n_tokens; t++) {
         int64_t slot = pos + t;
-        if (slot < 0 || slot >= ctx->kv_size) return -1;
+        if (slot < 0 || slot >= ctx->kv_size || slot >= policy->kv_size) return -1;
 
-        ctx->step++;
+        bool update_policy = (slot != policy->last_store_pos);
+        smart_kv_chunk_meta* c = &policy->chunks[slot];
+        uint8_t tier = c->target_tier;
 
-        // Update persistent write counter (survives cache clear)
-        ctx->total_writes[slot]++;
+        if (update_policy) {
+            policy->last_store_pos = slot;
+            policy->step++;
 
-        // Snapshot pre-update state for coldness check
-        smart_kv_chunk_meta* c = &ctx->chunks[slot];
-        uint64_t prev_step = c->last_used_step;
-        uint32_t prev_access = c->access_count;
-        bool was_unoccupied = (c->access_count == 0 && ctx->slot_tier[slot] == 0);
+            // Update persistent write counter (survives cache clear)
+            policy->total_writes[slot]++;
 
-        // Update chunk metadata
-        c->last_used_step = ctx->step;
-        c->access_count++;
-        if (was_unoccupied) ctx->cfg.memory_used++;
+            bool was_unoccupied = (c->access_count == 0 && policy->slot_tier[slot] == 0);
 
-        // Compute K/V norms if data is available (may be null for GPU-resident buffers)
-        if (k_fp16 && v_fp16) {
-            double k_sum_sq = 0.0, v_sum_sq = 0.0;
-            for (int32_t h = 0; h < ctx->n_head_kv; h++) {
-                int off_k = (int)((size_t)t * ctx->n_embd_k_gqa + (size_t)h * ctx->head_dim_k);
-                int off_v = (int)((size_t)t * ctx->n_embd_v_gqa + (size_t)h * ctx->head_dim_v);
-                k_sum_sq += compute_k_norm_head(k_fp16 + off_k, ctx->head_dim_k);
-                v_sum_sq += compute_k_norm_head(v_fp16 + off_v, ctx->head_dim_v);
+            // Update chunk metadata once per logical KV slot write.
+            c->last_used_step = policy->step;
+            c->access_count++;
+            if (c->access_count > policy->cached_max_access) {
+                policy->cached_max_access = c->access_count;
             }
-            float k_norm_tok = (float)(k_sum_sq / ctx->n_head_kv);
-            float v_norm_tok = (float)(v_sum_sq / ctx->n_head_kv);
+            if (was_unoccupied) policy->cfg.memory_used++;
 
-            // Welford online update for running mean + variance
-            if (c->n_tokens == 0) {
-                c->k_norm = k_norm_tok;
-                c->v_norm = v_norm_tok;
-                c->k_variance = 0.0f;
-            } else {
-                float prev_mean = c->k_norm;
-                float delta = k_norm_tok - prev_mean;
-                c->k_norm += delta / (float)(c->n_tokens + 1);
-                c->k_variance += delta * (k_norm_tok - c->k_norm);
-                c->v_norm += (v_norm_tok - c->v_norm) / (float)(c->n_tokens + 1);
-            }
-            c->n_tokens++;
-        }
-
-        float attn = 0.5f;
-        if (c->k_norm > 0.0f || c->v_norm > 0.0f) {
-            float norm_signal = 0.5f * (c->k_norm + c->v_norm);
-            attn = 0.35f + 0.30f * tanhf(norm_signal);
-        }
-        float lambda_a = ctx->cfg.weights.lambda_a;
-        c->attention_ema = lambda_a * c->attention_ema + (1.0f - lambda_a) * attn;
-
-        // Score to determine tier (uses QuantRegressor or heuristic)
-        uint8_t tier = score_slot(ctx, slot);
-        if (tier >= 1 && tier <= SMART_KV_TIER_COUNT) {
-            ctx->n_tier_decisions[tier]++;
-            ctx->n_total_tier_decisions++;
-            if (g_stats_interval > 0 && (ctx->n_total_tier_decisions % g_stats_interval) == 0) {
-                dump_stats(ctx, "live");
-            }
-        }
-
-        // Context compression: periodically drop cold slots when cache is full
-        if (g_compress_mode && (ctx->n_total_tier_decisions % g_compress_interval) == 0) {
-            compress_cold_slots(ctx);
-        }
-
-        // Collect training data: sample current slot always, cold slots near write cursor
-        if (g_train_mode || g_snapshot_exports) {
-            uint32_t max_access = ctx->cached_max_access;
-
-            uint64_t samples_seen = collect_training_sample(ctx, slot, max_access);
-            int64_t kv_sz = (int64_t)ctx->kv_size;
-            const int cold_offsets[] = { -256 };
-            for (int c = 0; c < 1; c++) {
-                int64_t cold = (slot + kv_sz + cold_offsets[c]) % kv_sz;
-                int probes = 0;
-                while ((cold == slot || ctx->chunks[cold].access_count == 0) && probes < (int)(kv_sz / 4)) {
-                    cold = (cold + 1) % kv_sz;
-                    probes++;
+            // Compute K/V norms if data is available (may be null for GPU-resident buffers).
+            if (k_fp16 && v_fp16) {
+                double k_sum_sq = 0.0, v_sum_sq = 0.0;
+                for (int32_t h = 0; h < ctx->n_head_kv; h++) {
+                    int off_k = (int)((size_t)t * ctx->n_embd_k_gqa + (size_t)h * ctx->head_dim_k);
+                    int off_v = (int)((size_t)t * ctx->n_embd_v_gqa + (size_t)h * ctx->head_dim_v);
+                    k_sum_sq += compute_k_norm_head(k_fp16 + off_k, ctx->head_dim_k);
+                    v_sum_sq += compute_k_norm_head(v_fp16 + off_v, ctx->head_dim_v);
                 }
-                if (cold != slot && ctx->chunks[cold].access_count > 0)
-                    samples_seen = collect_training_sample(ctx, cold, max_access);
+                float k_norm_tok = (float)(k_sum_sq / ctx->n_head_kv);
+                float v_norm_tok = (float)(v_sum_sq / ctx->n_head_kv);
+
+                // Welford online update for running mean + variance
+                if (c->n_tokens == 0) {
+                    c->k_norm = k_norm_tok;
+                    c->v_norm = v_norm_tok;
+                    c->k_variance = 0.0f;
+                } else {
+                    float prev_mean = c->k_norm;
+                    float delta = k_norm_tok - prev_mean;
+                    c->k_norm += delta / (float)(c->n_tokens + 1);
+                    c->k_variance += delta * (k_norm_tok - c->k_norm);
+                    c->v_norm += (v_norm_tok - c->v_norm) / (float)(c->n_tokens + 1);
+                }
+                c->n_tokens++;
             }
 
-            // Optional debug snapshots. Disabled by default so training uses
-            // one dataset accumulated over the whole collector run.
-            if (ctx->train_ring && g_snapshot_exports &&
-                (ctx->train_ring->count == 1000 || ctx->train_ring->count == 2000 ||
-                 ctx->train_ring->count == 4000 || ctx->train_ring->count == 6000 ||
-                 ctx->train_ring->count == 7500)) {
-                // Debug: count positive RAM labels
-                if (ctx->train_ring->count == 1000) {
-                    int pos = 0;
-                    for (uint32_t k = 0; k < ctx->train_ring->count; k++)
-                        if (ctx->train_ring->samples[k].ram_label > 0.5f) pos++;
-                    fprintf(stderr, "[debug-export] n=%u ram_pos=%u\n", ctx->train_ring->count, pos);
+            float attn = 0.5f;
+            if (c->k_norm > 0.0f || c->v_norm > 0.0f) {
+                float norm_signal = 0.5f * (c->k_norm + c->v_norm);
+                attn = 0.35f + 0.30f * tanhf(norm_signal);
+            }
+            float lambda_a = policy->cfg.weights.lambda_a;
+            c->attention_ema = lambda_a * c->attention_ema + (1.0f - lambda_a) * attn;
+
+            // Score to determine tier (uses QuantRegressor or heuristic)
+            tier = score_slot(policy, slot);
+            if (tier >= 1 && tier <= SMART_KV_TIER_COUNT) {
+                policy->n_tier_decisions[tier]++;
+                policy->n_total_tier_decisions++;
+                if (g_stats_interval > 0 && (policy->n_total_tier_decisions % g_stats_interval) == 0) {
+                    dump_stats(policy, "live");
                 }
-                char name[64];
-                char dpath[512];
-                snprintf(name, sizeof(name), "training_data_%u.bin", ctx->train_ring->count);
-                make_export_path(dpath, sizeof(dpath), name);
-                int n = ls_export_dataset(dpath, ctx->train_ring);
-                fprintf(stderr, "[smart-tq] exported %d samples to %s\n", n, dpath);
             }
 
-            if (g_train_mode && samples_seen >= 1000 && (samples_seen % 4096) == 0) {
-                char dpath[512];
-                make_export_path(dpath, sizeof(dpath), "training_data_latest.bin");
-                int n = ctx->train_ring ? ls_export_dataset(dpath, ctx->train_ring) : 0;
-                uint32_t ram_pos = 0;
-                if (ctx->train_ring) {
-                    for (uint32_t k = 0; k < ctx->train_ring->count; k++)
-                        if (ctx->train_ring->samples[k].ram_label > 0.5f) ram_pos++;
-                }
-                float pct = ctx->train_ring && ctx->train_ring->count > 0 ? (100.0f * ram_pos / ctx->train_ring->count) : 0.0f;
-                fprintf(stderr, "[smart-tq] updated rolling dataset: %d samples (%llu seen) ram_pos=%u/%.1f%% to %s\n",
-                        n, (unsigned long long)samples_seen, ram_pos, pct, dpath);
+            // Context compression: periodically drop cold slots when cache is full
+            if (g_compress_mode && (policy->n_total_tier_decisions % g_compress_interval) == 0) {
+                compress_cold_slots(policy);
             }
+
+            // Collect training data: sample current slot always, cold slots near write cursor
+            if (g_train_mode || g_snapshot_exports) {
+                uint32_t max_access = policy->cached_max_access;
+
+                uint64_t samples_seen = collect_training_sample(policy, slot, max_access);
+                int64_t kv_sz = (int64_t)policy->kv_size;
+                const int cold_offsets[] = { -256 };
+                for (int cidx = 0; cidx < 1; cidx++) {
+                    int64_t cold = (slot + kv_sz + cold_offsets[cidx]) % kv_sz;
+                    int probes = 0;
+                    while ((cold == slot || policy->chunks[cold].access_count == 0) && probes < (int)(kv_sz / 4)) {
+                        cold = (cold + 1) % kv_sz;
+                        probes++;
+                    }
+                    if (cold != slot && policy->chunks[cold].access_count > 0)
+                        samples_seen = collect_training_sample(policy, cold, max_access);
+                }
+
+                // Optional debug snapshots. Disabled by default so training uses
+                // one dataset accumulated over the whole collector run.
+                if (policy->train_ring && g_snapshot_exports &&
+                    (policy->train_ring->count == 1000 || policy->train_ring->count == 2000 ||
+                     policy->train_ring->count == 4000 || policy->train_ring->count == 6000 ||
+                     policy->train_ring->count == 7500)) {
+                    // Debug: count positive RAM labels
+                    if (policy->train_ring->count == 1000) {
+                        int pos = 0;
+                        for (uint32_t k = 0; k < policy->train_ring->count; k++)
+                            if (policy->train_ring->samples[k].ram_label > 0.5f) pos++;
+                        fprintf(stderr, "[debug-export] n=%u ram_pos=%u\n", policy->train_ring->count, pos);
+                    }
+                    char name[64];
+                    char dpath[512];
+                    snprintf(name, sizeof(name), "training_data_%u.bin", policy->train_ring->count);
+                    make_export_path(dpath, sizeof(dpath), name);
+                    int n = ls_export_dataset(dpath, policy->train_ring);
+                    fprintf(stderr, "[smart-tq] exported %d samples to %s\n", n, dpath);
+                }
+
+                if (g_train_mode && samples_seen >= 1000 && (samples_seen % 4096) == 0) {
+                    char dpath[512];
+                    make_export_path(dpath, sizeof(dpath), "training_data_latest.bin");
+                    int n = policy->train_ring ? ls_export_dataset(dpath, policy->train_ring) : 0;
+                    uint32_t ram_pos = 0;
+                    if (policy->train_ring) {
+                        for (uint32_t k = 0; k < policy->train_ring->count; k++)
+                            if (policy->train_ring->samples[k].ram_label > 0.5f) ram_pos++;
+                    }
+                    float pct = policy->train_ring && policy->train_ring->count > 0 ? (100.0f * ram_pos / policy->train_ring->count) : 0.0f;
+                    fprintf(stderr, "[smart-tq] updated rolling dataset: %d samples (%llu seen) ram_pos=%u/%.1f%% to %s\n",
+                            n, (unsigned long long)samples_seen, ram_pos, pct, dpath);
+                }
+            }
+
+            c->tier = tier;
+            c->target_tier = tier;
         }
 
-        if (tier == SMART_KV_TIER_ULTRA_TQ) {
+        if (tier == SMART_KV_TIER_ULTRA_TQ && g_tq_encode_mode) {
             // ── Tier 6: TQ-encode on CPU only ──
             // k_fp16/v_fp16 may be NULL for GPU-resident buffers;
             // fall back to GPU F16 if data is not CPU-accessible.
             if (!k_fp16 || !v_fp16) {
                 free_tq_slot(ctx, slot);
-                ctx->slot_tier[slot] = 0;
-                c->tier = 0;
-                c->target_tier = 0;
+                if (update_policy) policy->slot_tier[slot] = 0;
                 continue;
             }
-            ctx->slot_tier[slot] = SMART_KV_TIER_ULTRA_TQ;
+            if (update_policy) policy->slot_tier[slot] = SMART_KV_TIER_ULTRA_TQ;
             if (!ctx->k_rows[slot]) {
                 ctx->k_rows[slot] = (uint8_t*)malloc(row_bytes_k);
                 ctx->n_tq_row_allocs++;
@@ -1021,9 +1059,7 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
             }
             if (!ctx->k_rows[slot] || !ctx->v_rows[slot]) {
                 free_tq_slot(ctx, slot);
-                ctx->slot_tier[slot] = 0;
-                c->tier = 0;
-                c->target_tier = 0;
+                if (update_policy) policy->slot_tier[slot] = 0;
                 continue;
             }
             uint8_t* k_row = ctx->k_rows[slot];
@@ -1037,21 +1073,15 @@ static int kv_cache_store(void* layer_ctx, int64_t pos,
                 encode_head_fp16(v_fp16 + off_v, ctx->head_dim_v,
                                  v_row + (size_t)h * ctx->tq_bytes, ctx->bits_per_angle);
             }
-            ctx->n_tier6_stored++;
+            if (update_policy) policy->n_tier6_stored++;
 
         } else {
             // ── Tier 1-5: store as F16 (GPU tensor handles this) ──
             // The GPU F16 tensor was already written by llama.cpp.
             // We just mark the slot as F16-tier.
-            if (ctx->slot_tier[slot] == SMART_KV_TIER_ULTRA_TQ) {
-                // Slot was previously TQ6 — now back on GPU, free CPU storage
-                free_tq_slot(ctx, slot);
-            }
-            ctx->slot_tier[slot] = 0;  // 0 = GPU F16
+            free_tq_slot(ctx, slot);
+            if (update_policy) policy->slot_tier[slot] = 0;  // 0 = GPU F16
         }
-
-        c->tier = tier;
-        c->target_tier = tier;
     }
 
     return 0;
@@ -1136,6 +1166,22 @@ static void kv_cache_clear(void* layer_ctx) {
     SmartTQContext* ctx = (SmartTQContext*)layer_ctx;
     if (!ctx) return;
 
+    if (ctx != g_shared_ctx) {
+        free_all_tq_slots(ctx);
+        return;
+    }
+
+    bool already_clear = ctx->cfg.memory_used == 0 &&
+        ctx->n_total_tier_decisions == 0 &&
+        ctx->n_tier6_stored == 0 &&
+        ctx->n_tier6_retrieved == 0 &&
+        (!ctx->train_ring || ctx->train_ring->count == 0);
+    if (already_clear) {
+        ctx->last_store_pos = -1;
+        ctx->cached_max_access = 0;
+        return;
+    }
+
     // Export training data before clearing (with raw RAM labels)
     if (ctx->train_ring && ctx->train_ring->count > 100) {
         char name[64];
@@ -1162,7 +1208,9 @@ static void kv_cache_clear(void* layer_ctx) {
     }
 
     ctx->step = 0;
+    ctx->last_store_pos = -1;
     ctx->cfg.memory_used = 0;
+    ctx->cached_max_access = 0;
     memset(ctx->n_tier_decisions, 0, sizeof(ctx->n_tier_decisions));
     ctx->n_total_tier_decisions = 0;
     ctx->n_tier6_stored = 0;

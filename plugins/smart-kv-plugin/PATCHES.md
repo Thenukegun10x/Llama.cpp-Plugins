@@ -387,11 +387,12 @@ ctx->cfg.memory_used = 0;
 uint64_t occupied = ctx->cfg.memory_used;
 ```
 
-### 10. Cached `max_access` avoids double scan
+### 10. Incremental `max_access` tracking (O(N) -> O(1))
 
-`score_slot` already scanned all slots for max_access; the training block
-immediately repeated the same scan. Now `score_slot` stores the result in
-`ctx->cached_max_access` and the training block reuses it.
+`score_slot` previously scanned all `kv_size` slots for `max_access` on every
+tier decision. With plugin callbacks multiplied across layers, this dominated
+prefill. `cached_max_access` is now updated when a slot's `access_count`
+increases, and `score_slot` reads the cached value directly.
 
 ### 11. Training collection gated behind mode flags
 
@@ -426,9 +427,31 @@ dead code (llama.cpp fills k_out/v_out before callback). Replaced with comment.
 //      // fills k_out/v_out before this callback. No plugin action needed.
 ```
 
+### 14. Logical-store de-duplication
+
+llama.cpp can call the KV plugin once per layer for the same logical slot. The
+smart policy is global per slot, so tier scoring and metadata updates now run
+only once per contiguous slot write using `last_store_pos`.
+
+```cpp
+if (slot == policy->last_store_pos) {
+    // Another layer is storing the same logical token.
+    // Keep per-layer payload handling separate from global policy updates.
+} else {
+    policy->last_store_pos = slot;
+    // update metadata + score once
+}
+```
+
+### 15. Live stats disabled by default
+
+`SMART_KV_STATS_INTERVAL` now defaults to `0`. Cache clear and unload still dump
+stats, but live JSON writes are opt-in to avoid periodic stalls during prompt
+ingest.
+
 ## `plugins/smart-kv-plugin/smart-kv-cache.h` — Threshold Syncing
 
-### 14. `smart_kv_should_offload` thresholds synced with `score_slot`
+### 16. `smart_kv_should_offload` thresholds synced with `score_slot`
 
 Training labels were computed with one policy (baseline 0.08, 3 bands) while
 inference used another (baseline 0.05, 5 bands). Now identical: baseline 0.05
@@ -436,7 +459,7 @@ with bands at 0.92, 0.85, 0.75, 0.65, 0.50.
 
 ## `plugins/smart-kv-plugin/smart-kv-cache.c` — Quant Table Safety
 
-### 15. `smart_kv_tier_to_type` underflow guard
+### 17. `smart_kv_tier_to_type` underflow guard
 
 Added `ti < 0` bounds check in both the known-type and fallback paths.
 When adding new quant types to `qtable[]`, review the `steps[]` offsets
@@ -448,7 +471,7 @@ These changes wire the plugin's tier decisions into llama.cpp's mixed-cache
 routing so that tier-6 slots go to the TQ plugin bucket (1 GPU cell, `~0.5 MB`)
 instead of the full F16 tensor (`~400 MB`).
 
-### 16. Plugin: `smart_tq_get_tier` export (`smart-tq-plugin.cpp`)
+### 18. Plugin: `smart_tq_get_tier` export (`smart-tq-plugin.cpp`)
 
 ```cpp
 extern "C" GGML_PLUGIN_EXPORT
@@ -459,7 +482,7 @@ uint8_t smart_tq_get_tier(uint32_t global_pos) {
 }
 ```
 
-### 17. Plugin loader: `ggml_plugin_get_export()` (`ggml-plugin.h`, `ggml-plugin.c`)
+### 19. Plugin loader: `ggml_plugin_get_export()` (`ggml-plugin.h`, `ggml-plugin.c`)
 
 Generic symbol lookup across all loaded plugins:
 
@@ -477,7 +500,7 @@ void* ggml_plugin_get_export(const char* symbol_name) {
 }
 ```
 
-### 18. `llama-model.cpp`: wire tier_fn_
+### 20. `llama-model.cpp`: wire tier_fn_
 
 Added after mixed cache creation in `create_memory()`:
 
@@ -488,7 +511,7 @@ auto fn = (tier_fn_t)ggml_plugin_get_export("smart_tq_get_tier");
 if (fn) mixed->set_tier_fn(fn);
 ```
 
-### 19. `llama-kv-cache-mixed.cpp`: tier-6 routing (not unified)
+### 21. `llama-kv-cache-mixed.cpp`: tier-6 routing (not unified)
 
 Changed routing from `t >= 1` (all tiers → TQ) to `t >= 6` (only CPU offload):
 
@@ -500,7 +523,7 @@ if (t >= 6) {  // was: t >= 1
 if (tier_fn_ && tier_fn_(global_pos) >= 6) return UINT32_MAX;  // was: >= 1
 ```
 
-### 20. `add_tq_plugin_bucket`: 1 cell placeholder
+### 22. `add_tq_plugin_bucket`: 1 cell placeholder
 
 Changed from `kv_size` cells to `1` cell — saves `~400 MB` GPU VRAM:
 
@@ -520,6 +543,78 @@ bi.capacity = 1;  // was: kv_size
 
 Tier-6 slots now **skip the GPU F16 allocation** entirely — they only exist
 in CPU TQ format. The 1-cell GPU bucket is a routing placeholder.
+
+## TQ Redesign: Per-Layer Payloads + Global Policy
+
+The original smart-TQ plugin returned one singleton context for all layers and
+for both K/V halves. That made smart policy global, but it also meant tier-6 TQ
+payload storage was not correct: real KV data is per layer, while the singleton
+had only one `k_rows[slot]` and one `v_rows[slot]` table.
+
+The redesign splits responsibilities:
+
+- `g_shared_ctx`: global policy owner (`slot_tier`, `chunks`, scoring state,
+  training ring, counters)
+- one `SmartTQContext` per model layer: per-layer TQ row tables (`k_rows`,
+  `v_rows`) and layer geometry
+
+### 23. llama.cpp: use one combined plugin context per layer
+
+The plugin API already expects one callback containing both K and V:
+
+```c
+int (*kv_cache_store)(void* layer_ctx, int64_t pos,
+                      const void* k_data, const void* v_data,
+                      int64_t n_tokens);
+```
+
+`src/llama-kv-cache.cpp` now creates one plugin context per layer and passes
+both rows in one call when they are host-accessible:
+
+```cpp
+layer.plugin_ctx_k = ggml_plugin_kv_cache_create_layer((int)il, &kvp, 4);
+layer.plugin_ctx_v = nullptr;
+
+const void * k_row = k_host ? (const uint8_t*)layer.k->data + idx * ggml_row_size(layer.k->type, layer.k->ne[0]) : nullptr;
+const void * v_row = v_host ? (const uint8_t*)layer.v->data + idx * ggml_row_size(layer.v->type, layer.v->ne[0]) : nullptr;
+
+ggml_plugin_kv_cache_store(layer.plugin_ctx_k, (int64_t)idx, k_row, v_row, 1);
+```
+
+`plugin_get_ctx_v()` returns the same combined context as `plugin_get_ctx_k()`
+so future callers still receive a valid handle.
+
+### 24. Plugin: per-layer row stores
+
+`kv_cache_create_layer()` now returns a distinct `SmartTQContext` per layer.
+The first context owns the global policy arrays; later contexts share those
+arrays but allocate independent TQ row-pointer tables.
+
+```cpp
+ctx->slot_tier    = g_shared_ctx->slot_tier;
+ctx->chunks       = g_shared_ctx->chunks;
+ctx->total_writes = g_shared_ctx->total_writes;
+
+ctx->k_rows = (uint8_t**)calloc((size_t)ctx->kv_size, sizeof(uint8_t*));
+ctx->v_rows = (uint8_t**)calloc((size_t)ctx->kv_size, sizeof(uint8_t*));
+```
+
+Stats aggregate TQ row allocation and live CPU bytes across all layer contexts.
+
+### 25. Experimental TQ encode gate
+
+Live CPU TQ writes are disabled by default to avoid reintroducing the prefill
+slowdown. Set `SMART_KV_TQ_ENCODE=1` to enable experimental TQ encoding when
+both K and V rows are available on host memory.
+
+Default behavior:
+
+- smart policy scoring remains active
+- TQ payload rows are not encoded during GPU-resident prefill
+- no GPU->CPU sync copy is forced from the plugin hot path
+
+This leaves the next production step as a cold-block migration path: migrate
+old GPU KV blocks to per-layer CPU TQ storage outside the hot prefill path.
 
 ## Applying the Patches
 
